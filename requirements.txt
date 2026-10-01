@@ -1,6 +1,8 @@
 streamlit
 pandas
-numpy
 pillow
+cryptography
 google-genai
 openai
+easyocr
+streamlit-cropper  # (선택) 드래그로 영역 지정
