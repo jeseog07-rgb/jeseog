@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import importlib.util
 import io
+import json
 import os
 import re
 import secrets
@@ -22,6 +23,11 @@ from urllib.parse import quote
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 import pandas as pd
 import streamlit as st
+
+try:
+  import streamlit.components.v1 as components
+except ImportError:
+  components = None
 
 try:
   from google import genai
@@ -82,6 +88,13 @@ CODE_TTL_SECONDS = 600  # 이메일 인증 코드 유효 시간
 CODE_MAX_ATTEMPTS = 5
 CODE_RESEND_SECONDS = 60
 SETUP_CODE_FILE = 'setup_code.txt'
+
+# 로그인 상태 유지(자동 로그인)
+REMEMBER_COOKIE = 'pubg_rt'
+REMEMBER_IDLE_DAYS = 14  # 이 기간 동안 접속이 없으면 만료 (접속할 때마다 연장)
+REMEMBER_MAX_DAYS = 30  # 연장해도 최초 로그인 후 이 기간이 지나면 다시 로그인
+REMEMBER_GRACE_SECONDS = 120  # 토큰 교체 직후 이전 토큰의 유예 시간
+REMEMBER_MAX_DEVICES = 10
 
 FREE_OCR = '무료 기본 OCR (EasyOCR)'
 CUSTOM_OPENROUTER = 'openrouter:custom'
@@ -188,12 +201,24 @@ def verify_password(password, stored):
   return hmac.compare_digest(legacy, stored)
 
 
+def get_secret(name, default=''):
+  """환경변수 → Streamlit Secrets 순으로 조회한다 (호스팅의 Secrets 설정 지원)."""
+  value = os.environ.get(name)
+  if value:
+    return value
+  try:
+    value = st.secrets.get(name)
+  except Exception:  # secrets 파일/설정이 없는 환경
+    return default
+  return str(value) if value else default
+
+
 @st.cache_resource
 def get_fernet():
   """API 키 암호화용 Fernet. cryptography 미설치 시 None."""
   if Fernet is None:
     return None
-  secret = os.environ.get('APP_SECRET_KEY')
+  secret = get_secret('APP_SECRET_KEY')
   if secret:
     key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
   elif os.path.exists(KEY_FILE):
@@ -345,6 +370,18 @@ def init_db():
             sent_at REAL NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS login_tokens (
+            token_hash TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            issued_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            last_used REAL NOT NULL
+        )
+    """)
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_token_user ON login_tokens(username)'
+    )
 
 
 def super_exists():
@@ -356,7 +393,7 @@ def super_exists():
 
 def get_setup_code():
   """최종관리자 최초 설정용 코드. 환경변수 또는 setup_code.txt 파일에 보관."""
-  env = os.environ.get('ADMIN_SETUP_CODE')
+  env = get_secret('ADMIN_SETUP_CODE')
   if env:
     return env
   if os.path.exists(SETUP_CODE_FILE):
@@ -428,7 +465,7 @@ def normalize_role(role, is_admin=0):
   return ROLE_ADMIN if is_admin else ROLE_USER
 
 
-def login_user(username, password):
+def login_user(username, password, remember=False):
   locked = check_login_lock()
   if locked:
     return False, locked
@@ -455,13 +492,130 @@ def login_user(username, password):
         login_fails=0,
         must_change_pw=(password == 'admin123'),
     )
+    if remember and cookies_supported():
+      issue_login_token(username)
     return True, ''
 
   note_auth_failure()
   return False, '아이디 또는 비밀번호가 올바르지 않습니다.'
 
 
+# ---------- 로그인 상태 유지 (쿠키 + 서버 저장 토큰) ----------
+def _token_hash(token):
+  return hashlib.sha256(token.encode()).hexdigest()
+
+
+def cookies_supported():
+  try:
+    st.context.cookies  # Streamlit 1.37+
+    return True
+  except Exception:
+    return False
+
+
+def read_remember_cookie():
+  try:
+    return st.context.cookies.get(REMEMBER_COOKIE, '') or ''
+  except Exception:
+    return ''
+
+
+def queue_cookie(action, token='', seconds=0):
+  """브라우저 쿠키 설정/삭제 명령을 예약한다 (다음 화면 그리기 때 전송)."""
+  st.session_state['cookie_cmd'] = (action, token, int(seconds))
+
+
+def flush_cookie_cmd():
+  cmd = st.session_state.pop('cookie_cmd', None)
+  if not cmd or components is None:
+    return
+  action, token, seconds = cmd
+  value = json.dumps(token if action == 'set' else '')
+  max_age = max(seconds, 0) if action == 'set' else 0
+  components.html(
+      f"""<script>
+      (function () {{
+        try {{
+          var p = window.parent;
+          var secure = p.location.protocol === 'https:' ? '; Secure' : '';
+          p.document.cookie = '{REMEMBER_COOKIE}=' + encodeURIComponent({value}) +
+              '; max-age={max_age}; path=/; SameSite=Lax' + secure;
+        }} catch (e) {{}}
+      }})();
+      </script>""",
+      height=0,
+  )
+
+
+def issue_login_token(username, issued_at=None):
+  """새 로그인 유지 토큰을 발급해 쿠키로 내려보낸다 (서버에는 해시만 저장)."""
+  now = time.time()
+  issued_at = issued_at or now
+  expires = min(
+      now + REMEMBER_IDLE_DAYS * 86400, issued_at + REMEMBER_MAX_DAYS * 86400
+  )
+  token = secrets.token_urlsafe(32)
+  with db() as conn:
+    conn.execute('DELETE FROM login_tokens WHERE expires_at < ?', (now,))
+    conn.execute(
+        'INSERT INTO login_tokens VALUES (?, ?, ?, ?, ?)',
+        (_token_hash(token), username, issued_at, expires, now),
+    )
+    conn.execute(  # 기기 수 제한: 오래된 것부터 정리
+        'DELETE FROM login_tokens WHERE username = ? AND token_hash IN ('
+        ' SELECT token_hash FROM login_tokens WHERE username = ?'
+        ' ORDER BY issued_at DESC LIMIT -1 OFFSET ?)',
+        (username, username, REMEMBER_MAX_DEVICES),
+    )
+  queue_cookie('set', token, expires - now)
+  return token
+
+
+def login_with_cookie():
+  """쿠키의 토큰이 유효하면 자동 로그인하고 토큰을 교체한다."""
+  token = read_remember_cookie()
+  if not token:
+    return False
+  now = time.time()
+  thash = _token_hash(token)
+  with db() as conn:
+    row = conn.execute(
+        'SELECT username, issued_at, expires_at FROM login_tokens WHERE token_hash = ?',
+        (thash,),
+    ).fetchone()
+    user = (
+        conn.execute(
+            'SELECT role, is_admin FROM users WHERE username = ?', (row[0],)
+        ).fetchone()
+        if row
+        else None
+    )
+    if not row or row[2] < now or not user:
+      conn.execute('DELETE FROM login_tokens WHERE token_hash = ?', (thash,))
+      queue_cookie('clear')
+      return False
+    # 사용한 토큰은 잠깐만 더 유효 (새 쿠키가 도착하기 전 새로고침 대비)
+    conn.execute(
+        'UPDATE login_tokens SET expires_at = ?, last_used = ? WHERE token_hash = ?',
+        (min(row[2], now + REMEMBER_GRACE_SECONDS), now, thash),
+    )
+  role = normalize_role(user[0], user[1])
+  st.session_state.update(
+      logged_in=True, username=row[0], role=role, is_admin=int(role != ROLE_USER),
+      login_fails=0, must_change_pw=False,
+  )
+  issue_login_token(row[0], issued_at=row[1])
+  return True
+
+
 def logout():
+  token = read_remember_cookie()
+  if token:
+    with db() as conn:
+      conn.execute(
+          'DELETE FROM login_tokens WHERE token_hash = ?', (_token_hash(token),)
+      )
+    queue_cookie('clear')
   st.session_state.update(
       logged_in=False, username='', role=ROLE_USER, is_admin=0,
       must_change_pw=False,
@@ -488,7 +642,7 @@ def refresh_session_role():
 # ---------- 이메일(SMTP) ----------
 def smtp_config():
   def pick(env_name, key, default=''):
-    return os.environ.get(env_name) or get_setting(key, default)
+    return get_secret(env_name) or get_setting(key, default)
 
   try:
     port = int(pick('SMTP_PORT', 'smtp_port', '465') or 465)
@@ -499,7 +653,7 @@ def smtp_config():
       'host': pick('SMTP_HOST', 'smtp_host'),
       'port': port,
       'user': user,
-      'password': os.environ.get('SMTP_PASSWORD')
+      'password': get_secret('SMTP_PASSWORD')
       or decrypt_secret(get_setting('smtp_password', '')),
       'sender': pick('SMTP_FROM', 'smtp_from') or user,
       'security': pick('SMTP_SECURITY', 'smtp_security', 'ssl').lower(),
@@ -751,6 +905,8 @@ def change_password(username, old_pw, new_pw):
         'UPDATE users SET password = ? WHERE username = ?',
         (hash_password(new_pw), username),
     )
+    conn.execute('DELETE FROM login_tokens WHERE username = ?', (username,))
+  queue_cookie('clear')
   return True, '비밀번호가 변경되었습니다.'
 
 
@@ -1178,12 +1334,127 @@ def link_column(label, display_text=None):
     return st.column_config.LinkColumn(label)
 
 
-def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적)'):
-  """닉네임 칸 자체를 전적 페이지 링크로 만들어 표시한다.
+MOBILE_LIST_LIMIT = 100
 
-  셀 값은 'URL#닉네임' 이고, 화면에는 '#' 뒤의 닉네임만 보인다.
+RESPONSIVE_CSS = """
+<style>
+/* ---------- 공통 (PC) ---------- */
+.block-container { max-width: 1400px; }
+div[data-baseweb="tab-list"] { overflow-x: auto; scrollbar-width: thin; }
+button[data-baseweb="tab"] { white-space: nowrap; }
+/* 쿠키 전송용 보이지 않는 iframe은 공간을 차지하지 않게 */
+div[data-testid="stElementContainer"]:has(iframe[height="0"]),
+.element-container:has(iframe[height="0"]) {
+  position: absolute; height: 0; margin: 0; padding: 0; overflow: hidden;
+}
+
+/* ---------- 모바일 (폭 640px 이하) ---------- */
+@media (max-width: 640px) {
+  .block-container { padding: 3.2rem 0.75rem 5rem 0.75rem !important; }
+  h1 { font-size: 1.5rem !important; line-height: 1.3 !important; }
+  h2 { font-size: 1.25rem !important; }
+  h3 { font-size: 1.08rem !important; }
+  /* iOS 입력창 확대 방지 + 터치하기 쉬운 크기 */
+  input, textarea { font-size: 16px !important; }
+  .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button,
+  [data-testid="stLinkButton"] a, a[data-testid^="stBaseLinkButton"] {
+    width: 100% !important; min-height: 2.9rem;
+  }
+  button[data-baseweb="tab"] { padding: 0.5rem 0.7rem; font-size: 0.92rem; }
+  [data-testid="stMetricValue"] { font-size: 1.25rem !important; }
+  [data-testid="stMetricLabel"] p { font-size: 0.72rem !important; }
+  [data-testid="stMetricDelta"] { font-size: 0.7rem !important; }
+  /* 숫자 요약은 한 줄(3칸)로 유지 */
+  .st-key-metrics_row [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 0.4rem !important; }
+  .st-key-metrics_row [data-testid="stColumn"], .st-key-metrics_row [data-testid="column"] {
+    min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;
+  }
+  .st-key-metrics_grid [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
+  .st-key-metrics_grid [data-testid="stColumn"], .st-key-metrics_grid [data-testid="column"] {
+    min-width: calc(33% - 0.4rem) !important; flex: 1 1 calc(33% - 0.4rem) !important; width: auto !important;
+  }
+}
+</style>
+"""
+
+
+def inject_css():
+  st.markdown(RESPONSIVE_CSS, unsafe_allow_html=True)
+
+
+def is_mobile():
+  """화면 모드 설정(자동/모바일/PC) 또는 접속 기기(User-Agent)로 모바일 여부 판단."""
+  mode = st.session_state.get('view_mode', '자동')
+  if mode == '모바일':
+    return True
+  if mode == 'PC':
+    return False
+  try:
+    ua = st.context.headers.get('User-Agent', '')
+  except Exception:  # 구버전 Streamlit
+    return False
+  return bool(re.search(r'Mobi|iPhone|iPod', ua or ''))
+
+
+def keyed_container(key):
+  """CSS로 꾸미기 위한 이름 붙은 컨테이너 (구버전은 일반 컨테이너)."""
+  try:
+    return st.container(key=key)
+  except TypeError:
+    return st.container()
+
+
+def bordered_container():
+  try:
+    return st.container(border=True)
+  except TypeError:
+    return st.container()
+
+
+def text_input_ac(label, autocomplete=None, **kwargs):
+  """autocomplete 속성을 지원하면 적용 (브라우저/비밀번호 관리자의 저장·자동완성용)."""
+  try:
+    return st.text_input(label, autocomplete=autocomplete, **kwargs)
+  except TypeError:  # 구버전 Streamlit
+    return st.text_input(label, **kwargs)
+
+
+def _short_time(text):
+  return text[:16] if re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d', text) else text
+
+
+def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적)', mobile_cols=None):
+  """닉네임을 전적 페이지 링크로 표시한다. PC는 표, 모바일은 카드형 목록.
+
+  PC 표의 셀 값은 'URL#닉네임' 이고, 화면에는 '#' 뒤의 닉네임만 보인다.
   """
   platform = current_platform()
+
+  if is_mobile():
+    clan_cols = [c for c in ('clan', '클랜') if c in df.columns]
+    if mobile_cols is None:
+      mobile_cols = [c for c in df.columns if c != nick_col and c not in clan_cols][:3]
+    extra_cols = [c for c in mobile_cols if c in df.columns]
+    lines = []
+    for _, row in df.head(MOBILE_LIST_LIMIT).iterrows():
+      nick = str(row[nick_col])
+      clan = next((str(row[c]).replace('`', '') for c in clan_cols if str(row[c]).strip()), '')
+      head = f'**[{md_escape(nick)}]({stats_url(nick, platform)})**'
+      if clan:
+        head = f'`{clan}` ' + head
+      extras = [
+          _short_time(str(row[c])) for c in extra_cols
+          if str(row[c]).strip() not in ('', 'nan', 'None')
+      ]
+      line = f'- {head}'
+      if extras:
+        line += '  \n  ' + md_escape(' · '.join(extras))
+      lines.append(line)
+    st.markdown('\n'.join(lines))
+    if len(df) > MOBILE_LIST_LIMIT:
+      st.caption(f'상위 {MOBILE_LIST_LIMIT}건만 표시했어요. 검색으로 좁혀 보세요.')
+    return
+
   linked = df.copy()
   linked[nick_col] = [f'{stats_url(n, platform)}#{n}' for n in df[nick_col]]
   try:
@@ -1286,7 +1557,7 @@ def show_recent_nicknames(limit=20):
   if df.empty:
     st.caption('아직 등록된 닉네임이 없습니다.')
   else:
-    nick_link_table(recent_view(df), nick_col='닉네임')
+    nick_link_table(recent_view(df), nick_col='닉네임', mobile_cols=['경과', '등록자'])
 
 
 def update_nickname(actor, is_admin, row_id, clan, nick):
@@ -1395,6 +1666,7 @@ def admin_reset_password(target):
         'UPDATE users SET password = ? WHERE username = ?',
         (hash_password(temp), target),
     )
+    conn.execute('DELETE FROM login_tokens WHERE username = ?', (target,))
   log_admin('비밀번호 초기화', target)
   return True, f'🔑 **{target}** 님의 임시 비밀번호: `{temp}` (이 알림을 닫으면 다시 볼 수 없습니다)'
 
@@ -1420,6 +1692,7 @@ def admin_delete_user(target, delete_nicks):
       return False, err
     conn.execute('DELETE FROM user_keys WHERE username = ?', (target,))
     conn.execute('DELETE FROM pending_signups WHERE username = ?', (target,))
+    conn.execute('DELETE FROM login_tokens WHERE username = ?', (target,))
     deleted = conn.execute(
         'DELETE FROM users WHERE username = ?', (target,)
     ).rowcount
@@ -1624,6 +1897,60 @@ def make_db_backup():
       return f.read()
 
 
+SQLITE_MAGIC = b'SQLite format 3\x00'
+MAX_RESTORE_MB = 100
+
+
+def validate_backup(data):
+  """업로드된 백업 파일 검사. (정상 여부, 오류 메시지, 통계)."""
+  if len(data) > MAX_RESTORE_MB * 1024 * 1024:
+    return False, f'파일이 너무 큽니다 (최대 {MAX_RESTORE_MB}MB).', {}
+  if not data.startswith(SQLITE_MAGIC):
+    return False, '이 앱의 백업(.db) 파일이 아닙니다.', {}
+  with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, 'upload.db')
+    with open(path, 'wb') as f:
+      f.write(data)
+    conn = sqlite3.connect(path)
+    try:
+      if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+        return False, '백업 파일이 손상되어 있습니다.', {}
+      tables = {
+          r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+      }
+      if not {'users', 'nicknames'} <= tables:
+        return False, '이 앱의 백업 파일이 아닙니다 (필요한 테이블이 없어요).', {}
+      stats = {
+          'users': conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],
+          'nicknames': conn.execute('SELECT COUNT(*) FROM nicknames').fetchone()[0],
+      }
+    except sqlite3.DatabaseError:
+      return False, '백업 파일을 읽을 수 없습니다.', {}
+    finally:
+      conn.close()
+  return True, '', stats
+
+
+def restore_database(data):
+  """백업 파일 내용으로 현재 DB를 통째로 교체한다. (성공 여부, 메시지)."""
+  ok, msg, stats = validate_backup(data)
+  if not ok:
+    return False, msg
+  with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, 'restore.db')
+    with open(path, 'wb') as f:
+      f.write(data)
+    src = sqlite3.connect(path)
+    dst = sqlite3.connect(DB_FILE)
+    try:
+      src.backup(dst)
+    finally:
+      dst.close()
+      src.close()
+  init_db()  # 구버전 백업이면 새 컬럼/테이블을 보완
+  return True, f'회원 {stats["users"]}명, 닉네임 {stats["nicknames"]}개를 복원했습니다.'
+
+
 def env_status():
   """설치/설정 상태 점검표."""
   def has(module):
@@ -1647,8 +1974,18 @@ def env_status():
 # ==========================================
 # 7. 로그인 화면
 # ==========================================
+# 저장된 로그인 토큰이 있으면 자동 로그인 (세션 시작 시 1회)
+if not st.session_state.logged_in and not st.session_state.get('cookie_checked'):
+  st.session_state.cookie_checked = True
+  if login_with_cookie():
+    st.rerun()
+flush_cookie_cmd()
+inject_css()
+
 if not st.session_state.logged_in:
   st.title('🎮 배틀그라운드 닉네임 관리 시스템')
+  # PC에서는 로그인 폼이 너무 넓지 않게 폭 제한
+  st.markdown('<style>.block-container{max-width:680px !important;}</style>', unsafe_allow_html=True)
   show_flash()
   needs_setup = not super_exists()
   login_tabs = st.tabs(
@@ -1660,10 +1997,21 @@ if not st.session_state.logged_in:
     st.subheader('로그인')
     st.caption('관리 기능은 권한이 있는 계정으로 로그인했을 때만 표시됩니다.')
     with st.form('login_form'):
-      u_input = st.text_input('아이디')
-      p_input = st.text_input('비밀번호', type='password')
+      u_input = text_input_ac('아이디', 'username')
+      p_input = text_input_ac('비밀번호', 'current-password', type='password')
+      remember = (
+          st.checkbox(
+              f'로그인 상태 유지 (이 기기에서 최대 {REMEMBER_MAX_DAYS}일)',
+              value=False,
+              help=f'새로고침하거나 브라우저를 껐다 켜도 로그인이 유지돼요. '
+              f'{REMEMBER_IDLE_DAYS}일 동안 접속하지 않거나 {REMEMBER_MAX_DAYS}일이 지나면 '
+              '다시 로그인해야 해요. 공용 PC에서는 체크하지 마세요.',
+          )
+          if cookies_supported()
+          else False
+      )
       if st.form_submit_button('로그인'):
-        ok, msg = login_user(u_input.strip(), p_input)
+        ok, msg = login_user(u_input.strip(), p_input, remember)
         if ok:
           st.rerun()
         else:
@@ -1705,12 +2053,12 @@ if not st.session_state.logged_in:
         st.rerun()
     else:
       with st.form('register_form'):
-        nu_input = st.text_input('사용할 아이디 (영문/숫자/_ 3~20자)')
+        nu_input = text_input_ac('사용할 아이디 (영문/숫자/_ 3~20자)', 'username')
         ne_input = st.text_input(
             '이메일 (인증 코드가 발송됩니다)' if verify_on else '이메일 (선택)'
         )
-        np_input = st.text_input('사용할 비밀번호 (8자 이상)', type='password')
-        np_confirm = st.text_input('비밀번호 확인', type='password')
+        np_input = text_input_ac('사용할 비밀번호 (8자 이상)', 'new-password', type='password')
+        np_confirm = text_input_ac('비밀번호 확인', 'new-password', type='password')
         if st.form_submit_button('인증 코드 받기' if verify_on else '회원가입'):
           if not nu_input or not np_input or (verify_on and not ne_input):
             st.warning('필수 항목을 모두 입력해주세요.')
@@ -1730,11 +2078,42 @@ if not st.session_state.logged_in:
   if needs_setup:
     with login_tabs[2]:
       st.subheader('최종관리자 설정 (최초 1회)')
+      if get_secret('ADMIN_SETUP_CODE'):
+        st.caption('호스팅 설정(Secrets)에 등록해 둔 `ADMIN_SETUP_CODE` 값을 입력하세요.')
+      else:
+        st.caption(
+            '설정 코드는 서버 로그(콘솔) 또는 앱 폴더의 `setup_code.txt`에서 확인할 수 있어요.'
+            ' 호스팅 중이라면 Secrets에 `ADMIN_SETUP_CODE`를 등록해 두는 방법이 가장 쉬워요.'
+        )
       st.caption(
-          '앱 폴더의 `setup_code.txt` 파일(또는 서버 콘솔)에서 설정 코드를 확인하세요.'
-          ' 이미 가입한 계정의 아이디·비밀번호를 입력하면 그 계정이 최종관리자가 되고,'
+          '이미 가입한 계정의 아이디·비밀번호를 입력하면 그 계정이 최종관리자가 되고,'
           ' 없는 아이디면 새 계정이 만들어집니다.'
       )
+      with st.expander('💾 백업 파일로 복원 (재시작으로 데이터가 사라졌을 때)'):
+        st.caption('이전에 받아 둔 백업(.db)을 올리면 회원·닉네임이 그대로 복구돼요. 설정 코드가 필요합니다.')
+        setup_up = st.file_uploader(
+            '백업 파일 (.db)', type=['db', 'sqlite', 'sqlite3'], key='setup_restore_upload'
+        )
+        setup_code_in = st.text_input('설정 코드', type='password', key='setup_restore_code')
+        if st.button('♻️ 복원하기', key='setup_restore_btn'):
+          lock_msg = check_login_lock()
+          if lock_msg:
+            st.error(lock_msg)
+          elif setup_up is None:
+            st.warning('백업 파일을 선택해 주세요.')
+          elif not hmac.compare_digest(setup_code_in.strip(), get_setup_code()):
+            note_auth_failure()
+            st.error('설정 코드가 올바르지 않습니다.')
+          else:
+            try:
+              r_ok, r_msg = restore_database(setup_up.getvalue())
+            except Exception as e:
+              r_ok, r_msg = False, f'복원 중 오류가 발생했습니다: {e}'
+            if r_ok:
+              flash('✅ ' + r_msg + ' 백업 시점의 계정으로 로그인해 주세요.')
+              st.rerun()
+            else:
+              st.error(r_msg)
       with st.form('setup_form'):
         su_input = st.text_input('아이디')
         sp_input = st.text_input('비밀번호', type='password')
@@ -1783,66 +2162,22 @@ with st.sidebar.expander('🔑 비밀번호 변경', expanded=st.session_state.m
         else:
           st.error(msg)
 
-st.sidebar.divider()
-st.sidebar.subheader('⚙️ AI / OCR 인식 설정')
 
-model_ids = [m[0] for m in MODEL_CATALOG]
-default_id, saved_custom = resolve_saved_model(get_user_model(username))
-selected_model = st.sidebar.selectbox(
-    '사용할 모델 / 인식 엔진 선택',
-    model_ids,
-    index=model_ids.index(default_id),
-    format_func=lambda i: MODEL_BY_ID[i][1],
-)
-provider = MODEL_BY_ID[selected_model][2]
-
-custom_model = ''
-if selected_model == CUSTOM_OPENROUTER:
-  custom_model = st.sidebar.text_input(
-      'OpenRouter 모델 ID',
-      value=saved_custom,
-      placeholder='예: 제공자/모델명:free (이미지 입력 지원 모델)',
-  ).strip()
-
-saved_key, env_key, api_key_input = '', '', ''
-if provider == 'local':
-  st.sidebar.caption('API 키 없이 동작합니다. 닉네임 영역만 잘라 올리면 더 정확해요.')
-else:
-  info = PROVIDERS[provider]
-  saved_key = get_saved_key(username, provider)
-  env_key = os.environ.get(info['env'], '')
-  api_key_input = st.sidebar.text_input(
-      f"{info['name']} API 키",
-      type='password',
-      placeholder=(
-          '저장된 키 사용 중 (바꿀 때만 입력)' if saved_key else '키를 입력하세요'
-      ),
-  ).strip()
-  st.sidebar.caption(f"{info['note']} · [키 발급]({info['url']})")
-  if env_key and not saved_key and not api_key_input:
-    st.sidebar.caption(f"서버 환경변수 {info['env']} 를 사용합니다.")
-  if Fernet is None:
-    st.sidebar.warning(
-        '`cryptography` 미설치: API 키가 암호화되지 않고 저장됩니다.'
-        ' (pip install cryptography)'
-    )
-
-col_save, col_del = st.sidebar.columns(2)
-if col_save.button('설정 저장'):
-  to_save = selected_model
-  if selected_model == CUSTOM_OPENROUTER and custom_model:
-    to_save = f'openrouter:{custom_model}'
-  save_user_model(username, to_save)
-  if provider != 'local' and api_key_input:
-    save_key(username, provider, api_key_input)
-  flash('설정이 저장되었습니다.')
-  st.rerun()
-if provider != 'local' and saved_key and col_del.button('키 삭제'):
-  delete_key(username, provider)
-  flash('저장된 API 키를 삭제했습니다.')
-  st.rerun()
-
-active_key = api_key_input or saved_key or env_key
+with st.sidebar.expander('🔐 로그인 관리'):
+  with db() as conn:
+    n_dev = conn.execute(
+        'SELECT COUNT(*) FROM login_tokens WHERE username = ? AND expires_at > ?',
+        (username, time.time()),
+    ).fetchone()[0]
+  st.caption(
+      f'로그인 상태가 유지 중인 기기: {n_dev}대 '
+      f'(최대 {REMEMBER_MAX_DAYS}일 · {REMEMBER_IDLE_DAYS}일 접속 안 하면 만료)'
+  )
+  if st.button('모든 기기에서 로그아웃'):
+    with db() as conn:
+      conn.execute('DELETE FROM login_tokens WHERE username = ?', (username,))
+    logout()
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.selectbox(
@@ -1850,6 +2185,12 @@ st.sidebar.selectbox(
     list(STATS_PLATFORMS),
     key='stats_platform',
     help='닉네임을 클릭하면 이 플랫폼 기준 DAK.GG 전적 페이지가 새 탭으로 열립니다.',
+)
+st.sidebar.selectbox(
+    '📱 화면 모드',
+    ['자동', '모바일', 'PC'],
+    key='view_mode',
+    help='자동: 접속 기기에 맞춰 표시 · 목록이 불편하면 직접 바꿔보세요.',
 )
 
 # ==========================================
@@ -1874,6 +2215,72 @@ with main_tab1:
       f'게임 스크린샷을 업로드하면 스쿼드 최대 인원인 **최대 {MAX_SQUAD}명까지만**'
       ' 닉네임을 추출합니다.'
   )
+
+  with st.expander('⚙️ AI / OCR 인식 설정', expanded=False):
+    model_ids = [m[0] for m in MODEL_CATALOG]
+    default_id, saved_custom = resolve_saved_model(get_user_model(username))
+    selected_model = st.selectbox(
+        '사용할 모델 / 인식 엔진 선택',
+        model_ids,
+        index=model_ids.index(default_id),
+        format_func=lambda i: MODEL_BY_ID[i][1],
+    )
+    provider = MODEL_BY_ID[selected_model][2]
+
+    custom_model = ''
+    if selected_model == CUSTOM_OPENROUTER:
+      custom_model = st.text_input(
+          'OpenRouter 모델 ID',
+          value=saved_custom,
+          placeholder='예: 제공자/모델명:free (이미지 입력 지원 모델)',
+      ).strip()
+
+    saved_key, env_key, api_key_input = '', '', ''
+    if provider == 'local':
+      st.caption('API 키 없이 동작합니다. 닉네임 영역만 잘라 올리면 더 정확해요.')
+    else:
+      info = PROVIDERS[provider]
+      saved_key = get_saved_key(username, provider)
+      env_key = get_secret(info['env'])
+      api_key_input = st.text_input(
+          f"{info['name']} API 키",
+          type='password',
+          placeholder=(
+              '저장된 키 사용 중 (바꿀 때만 입력)' if saved_key else '키를 입력하세요'
+          ),
+      ).strip()
+      st.caption(f"{info['note']} · [키 발급]({info['url']})")
+      if env_key and not saved_key and not api_key_input:
+        st.caption(f"서버 환경변수 {info['env']} 를 사용합니다.")
+      if Fernet is None:
+        st.warning(
+            '`cryptography` 미설치: API 키가 암호화되지 않고 저장됩니다.'
+            ' (pip install cryptography)'
+        )
+
+    col_save, col_del = st.columns(2)
+    if col_save.button('설정 저장'):
+      to_save = selected_model
+      if selected_model == CUSTOM_OPENROUTER and custom_model:
+        to_save = f'openrouter:{custom_model}'
+      save_user_model(username, to_save)
+      if provider != 'local' and api_key_input:
+        save_key(username, provider, api_key_input)
+      flash('설정이 저장되었습니다.')
+      st.rerun()
+    if provider != 'local' and saved_key and col_del.button('키 삭제'):
+      delete_key(username, provider)
+      flash('저장된 API 키를 삭제했습니다.')
+      st.rerun()
+
+    active_key = api_key_input or saved_key or env_key
+
+  engine_label = (
+      custom_model
+      if selected_model == CUSTOM_OPENROUTER and custom_model
+      else MODEL_BY_ID[selected_model][1]
+  )
+  st.caption(f'🤖 현재 인식 엔진: {engine_label}  (위 "AI / OCR 인식 설정"에서 변경)')
 
   uploaded_file = st.file_uploader(
       '스크린샷 업로드', type=['png', 'jpg', 'jpeg', 'webp']
@@ -1979,37 +2386,56 @@ with main_tab1:
     st.caption('글자가 틀렸을 수 있어요. 닉네임을 고친 뒤 🔍 버튼으로 전적 페이지를 열어 확인하세요.')
     plat = current_platform()
 
-    head = st.columns([1, 2, 4, 2])
-    for col, text in zip(head, ['선택', '클랜', '닉네임 (수정 가능)', '전적 확인']):
-      col.caption(text)
-
     picked = []
-    for idx, entry in enumerate(st.session_state['extracted_nicknames']):
-      col1, col2, col3, col4 = st.columns([1, 2, 4, 2])
-      with col1:
-        is_checked = st.checkbox('선택', value=True, key=f'chk_{ver}_{idx}')
-      with col2:
-        clan_edit = st.text_input(
-            f'클랜 {idx + 1}',
-            value=entry['clan'],
-            key=f'clan_{ver}_{idx}',
-            placeholder='(없음)',
-            label_visibility='collapsed',
-        )
-      with col3:
-        nick_edit = st.text_input(
-            f'닉네임 {idx + 1}',
-            value=entry['nickname'],
-            key=f'txt_{ver}_{idx}',
-            label_visibility='collapsed',
-        ).strip()
-      with col4:
-        if nick_edit:
-          stats_button('🔍 전적 보기', stats_url(nick_edit, plat))
-        else:
-          st.button('🔍 전적 보기', disabled=True, key=f'nolink_{ver}_{idx}')
-      if is_checked and nick_edit:
-        picked.append({'clan': clan_edit.strip(' []()'), 'nickname': nick_edit})
+    if is_mobile():
+      # 모바일: 한 명당 카드 1개 (체크 · "[클랜] 닉네임" 한 칸 · 전적 버튼)
+      for idx, entry in enumerate(st.session_state['extracted_nicknames']):
+        with bordered_container():
+          is_checked = st.checkbox(f'{idx + 1}번 저장', value=True, key=f'mchk_{ver}_{idx}')
+          raw = st.text_input(
+              f'{idx + 1}번 · [클랜] 닉네임',
+              value=entry_label(entry['clan'], entry['nickname']),
+              key=f'mtxt_{ver}_{idx}',
+              help='형식: [클랜] 닉네임 (클랜이 없으면 닉네임만)',
+          )
+          parsed = make_entry(raw)
+          if parsed['nickname']:
+            stats_button('🔍 전적 보기', stats_url(parsed['nickname'], plat))
+          else:
+            st.button('🔍 전적 보기', disabled=True, key=f'mnolink_{ver}_{idx}')
+        if is_checked and parsed['nickname']:
+          picked.append(parsed)
+    else:
+      head = st.columns([1, 2, 4, 2])
+      for col, text in zip(head, ['선택', '클랜', '닉네임 (수정 가능)', '전적 확인']):
+        col.caption(text)
+
+      for idx, entry in enumerate(st.session_state['extracted_nicknames']):
+        col1, col2, col3, col4 = st.columns([1, 2, 4, 2])
+        with col1:
+          is_checked = st.checkbox('선택', value=True, key=f'chk_{ver}_{idx}')
+        with col2:
+          clan_edit = st.text_input(
+              f'클랜 {idx + 1}',
+              value=entry['clan'],
+              key=f'clan_{ver}_{idx}',
+              placeholder='(없음)',
+              label_visibility='collapsed',
+          )
+        with col3:
+          nick_edit = st.text_input(
+              f'닉네임 {idx + 1}',
+              value=entry['nickname'],
+              key=f'txt_{ver}_{idx}',
+              label_visibility='collapsed',
+          ).strip()
+        with col4:
+          if nick_edit:
+            stats_button('🔍 전적 보기', stats_url(nick_edit, plat))
+          else:
+            st.button('🔍 전적 보기', disabled=True, key=f'nolink_{ver}_{idx}')
+        if is_checked and nick_edit:
+          picked.append({'clan': clan_edit.strip(' []()'), 'nickname': nick_edit})
 
     manual_add = st.text_input(
         '직접 추가 (쉼표로 구분, "[클랜] 닉네임" 형식 가능 · 전체 합계'
@@ -2056,10 +2482,11 @@ with main_tab_search:
         ' COALESCE(SUM(substr(created_at, 1, 10) = ?), 0) FROM nicknames',
         (datetime.now().strftime('%Y-%m-%d'),),
     ).fetchone()
-  mc1, mc2, mc3 = st.columns(3)
-  mc1.metric('등록된 닉네임', n_total)
-  mc2.metric('고유 닉네임', n_unique)
-  mc3.metric('오늘 추가', n_today)
+  with keyed_container('metrics_row'):
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric('등록된 닉네임', n_total)
+    mc2.metric('고유 닉네임', n_unique)
+    mc3.metric('오늘 추가', n_today)
 
   query = st.text_input(
       '🔍 닉네임 · 클랜 · 등록자 검색',
@@ -2074,14 +2501,14 @@ with main_tab_search:
     if cand.empty:
       st.info('검색 결과가 없습니다. 철자를 바꿔서 다시 찾아보세요.')
     else:
-      nick_link_table(search_view(cand), nick_col='닉네임')
+      nick_link_table(search_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자'])
   else:
     cand = load_recent_nicknames(30)
     st.subheader('🕒 최근 추가된 닉네임')
     if cand.empty:
       st.info('아직 등록된 닉네임이 없습니다.')
     else:
-      nick_link_table(recent_view(cand), nick_col='닉네임')
+      nick_link_table(recent_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자'])
 
   # ---- 전적 확인 (오타 수정 후 검색) ----
   st.divider()
@@ -2145,7 +2572,7 @@ with main_tab2:
   if df_my.empty:
     st.info('아직 수집된 닉네임이 없습니다.')
   else:
-    nick_link_table(df_my)
+    nick_link_table(df_my, mobile_cols=['created_at', 'source_image'])
     st.caption('닉네임을 클릭하면 DAK.GG 전적 페이지가 새 탭으로 열립니다 (검색 없이 바로 프로필).')
     st.download_button(
         label='📥 내 닉네임 목록 CSV 다운로드',
@@ -2180,6 +2607,16 @@ with main_tab2:
 if st.session_state.is_admin:
   with main_tab3:
     st.header('👑 관리자 패널')
+    if st.session_state.role == ROLE_SUPER:
+      _last = get_setting('last_backup_at', '')
+      try:
+        _age_h = (datetime.now() - datetime.strptime(_last, '%Y-%m-%d %H:%M:%S')).total_seconds() / 3600
+      except ValueError:
+        _age_h = None
+      if _age_h is None:
+        st.warning('💾 아직 DB 백업을 만든 적이 없어요. 호스팅이 재시작되면 데이터가 사라질 수 있으니 `시스템` 탭에서 백업을 받아 두세요.')
+      elif _age_h > 24:
+        st.warning(f'💾 마지막 백업이 {_age_h / 24:.0f}일 전이에요. `시스템` 탭에서 새 백업을 받아 두세요.')
     a_dash, a_nick, a_user, a_log, a_sys = st.tabs(
         ['📈 대시보드', '🗂 닉네임 관리', '👥 회원 관리', '📜 활동 로그', '⚙️ 시스템 (최종관리자)']
     )
@@ -2187,12 +2624,13 @@ if st.session_state.is_admin:
     # ---------- 대시보드 ----------
     with a_dash:
       stats = load_stats()
-      m1, m2, m3, m4, m5 = st.columns(5)
-      m1.metric('전체 회원', stats['users'], f"관리자 {stats['admins']}명")
-      m2.metric('수집된 닉네임', stats['nicks'])
-      m3.metric('고유 닉네임', stats['unique'], help='대소문자를 무시한 중복 제거 수')
-      m4.metric('오늘 수집', stats['today'])
-      m5.metric('가입 상태', '허용' if get_setting('allow_signup', '1') == '1' else '중지')
+      with keyed_container('metrics_grid'):
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric('전체 회원', stats['users'], f"관리자 {stats['admins']}명")
+        m2.metric('수집된 닉네임', stats['nicks'])
+        m3.metric('고유 닉네임', stats['unique'], help='대소문자를 무시한 중복 제거 수')
+        m4.metric('오늘 수집', stats['today'])
+        m5.metric('가입 상태', '허용' if get_setting('allow_signup', '1') == '1' else '중지')
 
       left, right = st.columns(2)
       with left:
@@ -2311,6 +2749,7 @@ if st.session_state.is_admin:
                   'nickname': '닉네임', 'users': '수집 회원 수', 'collectors': '수집자'
               }),
               nick_col='닉네임',
+              mobile_cols=['수집자'],
           )
 
     # ---------- 회원 관리 ----------
@@ -2486,7 +2925,7 @@ if st.session_state.is_admin:
 
         st.divider()
         st.subheader('📧 이메일(SMTP) 설정')
-        if os.environ.get('SMTP_HOST'):
+        if get_secret('SMTP_HOST'):
           st.caption('환경변수(SMTP_*)가 설정되어 있어 입력값보다 우선 적용됩니다.')
         sec_options = ['ssl', 'starttls', 'none']
         cur_sec = get_setting('smtp_security', 'ssl')
@@ -2547,7 +2986,11 @@ if st.session_state.is_admin:
             f'파일: `{DB_FILE}` · {size_kb:,.1f} KB · 회원 {counts["users"]} · 닉네임'
             f' {counts["nicknames"]} · 저장된 API 키 {counts["user_keys"]} · 로그 {counts["admin_log"]}'
         )
+        st.caption('⚠️ Streamlit Cloud 같은 호스팅에서는 앱이 재시작되면 이 DB 파일이 사라질 수 있어요. 백업을 자주 받아 두세요.')
+        _lb = get_setting('last_backup_at', '')
+        st.caption(f'마지막 백업: {_lb or "없음"}')
         if st.button('💾 DB 백업 파일 생성'):
+          set_setting('last_backup_at', now_str())
           st.session_state['db_backup'] = make_db_backup()
           st.session_state['db_backup_name'] = (
               f'pubg_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
@@ -2561,6 +3004,48 @@ if st.session_state.is_admin:
               mime='application/octet-stream',
           )
           st.warning('백업에는 비밀번호 해시와 암호화된 API 키가 들어 있습니다. 안전하게 보관하세요.')
+
+        st.divider()
+        st.subheader('♻️ 백업에서 복원')
+        st.caption(
+            '백업 파일(.db)을 올리면 현재 데이터가 **모두 백업 내용으로 교체**돼요. '
+            '저장된 API 키·SMTP 비밀번호는 백업 때와 같은 `APP_SECRET_KEY`일 때만 복호화됩니다.'
+        )
+        if st.session_state.get('pre_restore_backup'):
+          st.download_button(
+              '⬇️ 복원 직전 데이터 내려받기 (되돌리기용)',
+              data=st.session_state['pre_restore_backup'],
+              file_name=f'pubg_before_restore_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db',
+              mime='application/octet-stream',
+          )
+        restore_up = st.file_uploader(
+            '복원할 백업 파일 (.db)', type=['db', 'sqlite', 'sqlite3'], key='restore_upload'
+        )
+        if restore_up is not None:
+          restore_data = restore_up.getvalue()
+          r_ok, r_msg, r_stats = validate_backup(restore_data)
+          if not r_ok:
+            st.error(r_msg)
+          else:
+            st.info(f'백업 내용: 회원 {r_stats["users"]}명 · 닉네임 {r_stats["nicknames"]}개')
+            with st.form('restore_form'):
+              r_agree = st.checkbox('현재 데이터가 모두 덮어써지는 것에 동의합니다.')
+              if st.form_submit_button('♻️ 복원하기'):
+                if not r_agree:
+                  st.warning('동의에 체크해 주세요.')
+                else:
+                  try:
+                    pre_snapshot = make_db_backup()
+                    r_ok, r_msg = restore_database(restore_data)
+                  except Exception as e:
+                    r_ok, r_msg = False, f'복원 중 오류가 발생했습니다: {e}'
+                  if r_ok:
+                    st.session_state['pre_restore_backup'] = pre_snapshot
+                    log_admin('DB 복원', '', r_msg)
+                    flash('✅ ' + r_msg + ' (백업의 계정 기준으로 다시 로그인이 필요할 수 있어요)')
+                    st.rerun()
+                  else:
+                    st.error(r_msg)
 
         st.divider()
         st.subheader('환경 점검')

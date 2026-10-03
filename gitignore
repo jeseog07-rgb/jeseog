@@ -1,0 +1,10 @@
+# 비밀/개인정보 파일은 GitHub에 올리지 마세요
+pubg_manager.db
+pubg_manager.db-*
+pubg_tracker.db
+*.db
+.app_secret.key
+setup_code.txt
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
