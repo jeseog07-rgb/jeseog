@@ -14,10 +14,14 @@ import re
 import secrets
 import smtplib
 import sqlite3
+import gzip
 import ssl
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import quote
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
@@ -51,6 +55,11 @@ except ImportError:
   st_cropper = None
 
 # 페이지 설정 (Streamlit 첫 호출이어야 함)
+# 시간대 (리눅스 호스팅은 기본 UTC라 한국 시간으로 맞춘다. 환경변수 APP_TIMEZONE으로 변경 가능)
+if hasattr(time, 'tzset'):
+  os.environ['TZ'] = os.environ.get('APP_TIMEZONE', 'Asia/Seoul')
+  time.tzset()
+
 st.set_page_config(
     page_title='배틀그라운드 닉네임 수집 및 관리 시스템',
     page_icon='🎮',
@@ -66,6 +75,7 @@ PBKDF2_ITERATIONS = 200_000
 MAX_SQUAD = 4
 MAX_NICK_LEN = 32
 MAX_UPLOAD_MB = 10
+MAX_BATCH_FILES = 8  # 한 번에 처리할 스크린샷 수
 MAX_IMAGE_SIDE = 3840  # 업로드 이미지 보관 해상도 (작은 글씨 보존)
 MAX_FULL_SIDE = 2000  # 전체 화면 인식 시 해상도 제한
 MAX_SEND_SIDE = 2400  # AI 전송 시 해상도 제한
@@ -87,7 +97,12 @@ ROLE_RANK = {ROLE_USER: 0, ROLE_ADMIN: 1, ROLE_SUPER: 2}
 CODE_TTL_SECONDS = 600  # 이메일 인증 코드 유효 시간
 CODE_MAX_ATTEMPTS = 5
 CODE_RESEND_SECONDS = 60
+TWOFA_PENDING = '__2fa__'  # login_user가 2단계 인증 대기 상태일 때 돌려주는 값
 SETUP_CODE_FILE = 'setup_code.txt'
+
+# 자동 클라우드 동기화 (GitHub 비공개 저장소에 암호화 스냅샷 저장)
+SYNC_MIN_INTERVAL = 60  # 변경 후 업로드까지 최소 간격(초)
+SYNC_DEFAULT_PATH = 'pubg_manager.db.enc'
 
 # 로그인 상태 유지(자동 로그인)
 REMEMBER_COOKIE = 'pubg_rt'
@@ -261,9 +276,12 @@ def decrypt_secret(stored):
 @contextmanager
 def db():
   conn = sqlite3.connect(DB_FILE, timeout=10)
+  changes_before = conn.total_changes
   try:
     yield conn
     conn.commit()
+    if conn.total_changes != changes_before:
+      mark_dirty()  # 데이터가 바뀌었으면 클라우드 동기화 예약
   except Exception:
     conn.rollback()
     raise
@@ -273,6 +291,291 @@ def db():
 
 def now_str():
   return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+# ==========================================
+# 2-1. 자동 클라우드 동기화 (재시작해도 데이터가 사라지지 않도록)
+# ==========================================
+@st.cache_resource
+def sync_state():
+  """프로세스 전체에서 공유되는 동기화 상태."""
+  return {
+      'lock': threading.Lock(), 'dirty': False, 'pushing': False,
+      'timer_active': False, 'timer': None, 'timer_due': 0.0,
+      'ready': False, 'last_push': 0.0,
+      'last_ok': '', 'last_error': '', 'sha': None, 'last_attempt': 0.0,
+      'restored': '', 'pushes': 0,
+  }
+
+
+def sync_config():
+  token = get_secret('GITHUB_SYNC_TOKEN')
+  repo = get_secret('GITHUB_SYNC_REPO')
+  if not (token and repo):
+    return None
+  return {
+      'token': token,
+      'repo': repo.strip().strip('/'),
+      'branch': get_secret('GITHUB_SYNC_BRANCH') or 'main',
+      'path': get_secret('GITHUB_SYNC_PATH') or SYNC_DEFAULT_PATH,
+      'api': (get_secret('GITHUB_API_URL') or 'https://api.github.com').rstrip('/'),
+      'fernet': get_fernet(),
+  }
+
+
+def sync_problem():
+  """동기화를 켤 수 없는 이유 (정상이면 빈 문자열)."""
+  if not sync_config():
+    return '설정되지 않음'
+  if Fernet is None:
+    return '`cryptography` 패키지가 필요합니다 (requirements.txt에 추가).'
+  if not get_secret('APP_SECRET_KEY'):
+    return '`APP_SECRET_KEY`를 Secrets에 고정해야 합니다 (스냅샷 암호화 키, 없으면 복구할 수 없어요).'
+  return ''
+
+
+def snapshot_db_bytes():
+  """SQLite 백업 API로 일관된 DB 스냅샷(bytes)을 만든다 (권한 검사 없음)."""
+  with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, 'snapshot.db')
+    src = sqlite3.connect(DB_FILE)
+    dst = sqlite3.connect(path)
+    try:
+      src.backup(dst)
+    finally:
+      dst.close()
+      src.close()
+    with open(path, 'rb') as f:
+      return f.read()
+
+
+def pack_snapshot(raw, fernet):
+  return fernet.encrypt(gzip.compress(raw, 6))
+
+
+def unpack_snapshot(blob, fernet):
+  return gzip.decompress(fernet.decrypt(blob))
+
+
+def _gh_request(cfg, method, path, body=None, accept='application/vnd.github+json', timeout=25):
+  data = json.dumps(body).encode() if body is not None else None
+  req = urllib.request.Request(cfg['api'] + path, data=data, method=method)
+  req.add_header('Authorization', f"Bearer {cfg['token']}")
+  req.add_header('Accept', accept)
+  req.add_header('X-GitHub-Api-Version', '2022-11-28')
+  req.add_header('User-Agent', 'pubg-nickname-manager')
+  if data is not None:
+    req.add_header('Content-Type', 'application/json')
+  try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+      return resp.status, resp.read()
+  except urllib.error.HTTPError as e:
+    return e.code, e.read()
+
+
+def _contents_path(cfg):
+  return f"/repos/{cfg['repo']}/contents/{quote(cfg['path'])}"
+
+
+def github_fetch(cfg):
+  """원격 스냅샷 바이트. 파일이 없으면 None."""
+  status, body = _gh_request(
+      cfg, 'GET', f"{_contents_path(cfg)}?ref={quote(cfg['branch'])}",
+      accept='application/vnd.github.raw+json',
+  )
+  if status == 200:
+    return body
+  if status == 404:
+    return None
+  raise RuntimeError(f'GitHub 응답 {status}: {body[:200]!r}')
+
+
+def github_sha(cfg):
+  status, body = _gh_request(cfg, 'GET', f"{_contents_path(cfg)}?ref={quote(cfg['branch'])}")
+  if status == 200:
+    return json.loads(body)['sha']
+  if status == 404:
+    return None
+  raise RuntimeError(f'GitHub 응답 {status}: {body[:200]!r}')
+
+
+def github_put(cfg, blob, state):
+  for attempt in range(2):
+    sha = state['sha'] if (attempt == 0 and state['sha']) else github_sha(cfg)
+    body = {
+        'message': f'snapshot {now_str()}',
+        'content': base64.b64encode(blob).decode(),
+        'branch': cfg['branch'],
+    }
+    if sha:
+      body['sha'] = sha
+    status, resp = _gh_request(cfg, 'PUT', _contents_path(cfg), body)
+    if status in (200, 201):
+      state['sha'] = json.loads(resp)['content']['sha']
+      return
+    if status in (409, 422) and attempt == 0:  # sha가 어긋남 → 최신 sha로 재시도
+      state['sha'] = None
+      continue
+    raise RuntimeError(f'GitHub 저장 실패 {status}: {resp[:200]!r}')
+
+
+def schedule_push(cfg, state, delay=None):
+  """업로드를 예약한다. 이미 예약돼 있어도 더 빠른 예약이면 교체한다."""
+  with state['lock']:
+    state['dirty'] = True
+    if state['pushing']:  # 업로드 중이면 끝난 뒤 다시 예약됨
+      return
+    if delay is None:
+      delay = max(0.0, SYNC_MIN_INTERVAL - (time.time() - state['last_push']))
+    due = time.time() + delay
+    if state['timer_active'] and state['timer_due'] <= due + 0.01:
+      return
+    if state['timer'] is not None:
+      state['timer'].cancel()
+    timer = threading.Timer(delay, push_worker, args=(cfg, state))
+    timer.daemon = True
+    state['timer'] = timer
+    state['timer_active'] = True
+    state['timer_due'] = due
+  timer.start()
+
+
+def push_worker(cfg, state):
+  with state['lock']:
+    state['timer_active'] = False
+    state['timer'] = None
+    if not state['dirty'] or state['pushing']:
+      return
+    state['dirty'] = False
+    state['pushing'] = True
+  error = ''
+  try:
+    github_put(cfg, pack_snapshot(snapshot_db_bytes(), cfg['fernet']), state)
+  except Exception as e:  # 실패하면 다시 시도
+    error = f'{type(e).__name__}: {e}'
+  with state['lock']:
+    state['pushing'] = False
+    state['last_push'] = time.time()
+    if error:
+      state['last_error'] = error
+      state['dirty'] = True
+    else:
+      state['last_ok'] = now_str()
+      state['last_error'] = ''
+      state['pushes'] += 1
+    again = state['dirty']
+  if again:
+    schedule_push(cfg, state, delay=120 if error else SYNC_MIN_INTERVAL)
+
+
+def mark_dirty():
+  """DB가 바뀌었음을 알린다 (동기화가 꺼져 있으면 아무 일도 안 함)."""
+  cfg = sync_config()
+  if not cfg or sync_problem():
+    return
+  state = sync_state()
+  if not state['ready']:  # 원격 확인 전에는 업로드 금지 (원격 데이터를 덮어쓰지 않도록)
+    return
+  schedule_push(cfg, state)
+
+
+def sync_push_now():
+  """즉시 업로드 (관리자 버튼). (성공 여부, 메시지)."""
+  problem = sync_problem()
+  if problem:
+    return False, problem
+  cfg, state = sync_config(), sync_state()
+  if not state['ready']:
+    return False, '시작 시 원격 확인이 끝나지 않았어요. 연결 테스트로 원인을 확인하세요.'
+  with state['lock']:
+    state['dirty'] = False
+    state['pushing'] = True
+  try:
+    github_put(cfg, pack_snapshot(snapshot_db_bytes(), cfg['fernet']), state)
+  except Exception as e:
+    with state['lock']:
+      state['pushing'] = False
+      state['dirty'] = True
+      state['last_error'] = f'{type(e).__name__}: {e}'
+    return False, state['last_error']
+  with state['lock']:
+    state['pushing'] = False
+    state['last_push'] = time.time()
+    state['last_ok'] = now_str()
+    state['last_error'] = ''
+    state['pushes'] += 1
+  return True, '업로드했습니다.'
+
+
+def sync_test():
+  """저장소 접근, 브랜치, 스냅샷 존재 여부를 점검한다. (성공 여부, 메시지)."""
+  problem = sync_problem()
+  if problem:
+    return False, problem
+  cfg = sync_config()
+  try:
+    status, body = _gh_request(cfg, 'GET', f"/repos/{cfg['repo']}")
+    if status != 200:
+      return False, f'저장소에 접근할 수 없어요 (응답 {status}). 저장소 이름과 토큰 권한을 확인하세요.'
+    blob = github_fetch(cfg)
+  except Exception as e:
+    return False, f'{type(e).__name__}: {e}'
+  if blob is None:
+    return True, '연결 정상 · 아직 저장된 스냅샷은 없어요 (첫 변경 후 자동 업로드됩니다).'
+  try:
+    unpack_snapshot(blob, cfg['fernet'])
+  except Exception:
+    return False, '스냅샷이 있지만 복호화에 실패했어요. APP_SECRET_KEY가 업로드 때와 다른 것 같아요.'
+  return True, f'연결 정상 · 스냅샷 {len(blob) / 1024:,.1f} KB 확인'
+
+
+def sync_pull_restore():
+  """원격 스냅샷으로 현재 DB를 교체한다 (관리자 버튼). (성공 여부, 메시지)."""
+  problem = sync_problem()
+  if problem:
+    return False, problem
+  cfg = sync_config()
+  try:
+    blob = github_fetch(cfg)
+    if blob is None:
+      return False, '원격에 저장된 스냅샷이 없습니다.'
+    return restore_database(unpack_snapshot(blob, cfg['fernet']))
+  except Exception as e:
+    return False, f'{type(e).__name__}: {e}'
+
+
+def sync_bootstrap():
+  """시작 시 1회: 로컬 DB가 비어 있고 원격 스냅샷이 있으면 자동 복원한다.
+
+  이 확인이 끝나기 전에는 업로드하지 않는다 (빈 DB가 원격 데이터를 덮어쓰는 사고 방지).
+  """
+  state = sync_state()
+  if state['ready'] or sync_problem():
+    return
+  if time.time() - state['last_attempt'] < 60:
+    return
+  state['last_attempt'] = time.time()
+  cfg = sync_config()
+  try:
+    with db() as conn:
+      users = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    if users > 0:
+      state['restored'] = '로컬 데이터를 그대로 사용'
+      state['ready'] = True
+      return
+    blob = github_fetch(cfg)
+    if blob is None:
+      state['restored'] = '원격 스냅샷 없음 (새로 시작)'
+      state['ready'] = True
+      return
+    ok, msg = restore_database(unpack_snapshot(blob, cfg['fernet']))
+    if not ok:
+      raise RuntimeError(msg)
+    state['restored'] = f'원격에서 자동 복원: {msg}'
+    state['ready'] = True
+    state['last_error'] = ''
+  except Exception as e:
+    state['last_error'] = f'시작 시 복원 확인 실패: {type(e).__name__}: {e}'
 
 
 def init_db():
@@ -382,6 +685,65 @@ def init_db():
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_token_user ON login_tokens(username)'
     )
+    if 'twofa' not in ucols:
+      conn.execute('ALTER TABLE users ADD COLUMN twofa INTEGER DEFAULT 0')
+    if 'login_alert' not in ucols:
+      conn.execute('ALTER TABLE users ADD COLUMN login_alert INTEGER DEFAULT 0')
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS email_codes (
+            purpose TEXT NOT NULL,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            sent_at REAL NOT NULL,
+            PRIMARY KEY (purpose, username)
+        )
+    """)
+
+    # 함께한 사람(스쿼드 기록) / 개인 메모·즐겨찾기 / 내 닉네임
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS squad_members (
+            squad_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            nickname TEXT NOT NULL,
+            clan TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_squad_id ON squad_members(squad_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_squad_owner ON squad_members(owner)')
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nick_notes (
+            owner TEXT NOT NULL,
+            nick_key TEXT NOT NULL,
+            nickname TEXT NOT NULL,
+            favorite INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner, nick_key)
+        )
+    """)
+    if 'my_nickname' not in ucols:
+      conn.execute("ALTER TABLE users ADD COLUMN my_nickname TEXT DEFAULT ''")
+    # 구버전 데이터: 같은 시각·같은 출처로 저장된 닉네임을 한 판으로 간주 (최초 1회)
+    if conn.execute('SELECT COUNT(*) FROM squad_members').fetchone()[0] == 0:
+        groups = {}
+        for u, ts, src, nick, clan in conn.execute(
+            "SELECT username, created_at, COALESCE(source_image, ''), nickname,"
+            " COALESCE(clan, '') FROM nicknames WHERE created_at IS NOT NULL ORDER BY id"
+        ).fetchall():
+          groups.setdefault((u, ts, src), []).append((nick, clan))
+        for (u, ts, _src), members in groups.items():
+          if len(members) >= 2:
+            sid = secrets.token_hex(6)
+            conn.executemany(
+                'INSERT INTO squad_members VALUES (?, ?, ?, ?, ?)',
+                [(sid, u, n, c, ts) for n, c in members],
+            )
 
 
 def super_exists():
@@ -465,14 +827,34 @@ def normalize_role(role, is_admin=0):
   return ROLE_ADMIN if is_admin else ROLE_USER
 
 
+def open_session(username, remember=False, must_change_pw=False):
+  """로그인 성공 처리: 세션 상태 설정 + (선택) 로그인 유지 토큰 발급."""
+  with db() as conn:
+    row = conn.execute(
+        'SELECT role, is_admin FROM users WHERE username = ?', (username,)
+    ).fetchone()
+  role = normalize_role(row[0], row[1]) if row else ROLE_USER
+  st.session_state.update(
+      logged_in=True,
+      username=username,
+      role=role,
+      is_admin=int(role != ROLE_USER),
+      login_fails=0,
+      must_change_pw=must_change_pw,
+  )
+  if remember and cookies_supported():
+    issue_login_token(username)
+
+
 def login_user(username, password, remember=False):
+  """(성공 여부, 메시지). 2단계 인증이 필요하면 (False, TWOFA_PENDING)."""
   locked = check_login_lock()
   if locked:
     return False, locked
 
   with db() as conn:
     row = conn.execute(
-        'SELECT password, is_admin, role FROM users WHERE username = ?',
+        'SELECT password, twofa, email, email_verified FROM users WHERE username = ?',
         (username,),
     ).fetchone()
 
@@ -483,21 +865,48 @@ def login_user(username, password, remember=False):
             'UPDATE users SET password = ? WHERE username = ?',
             (hash_password(password), username),
         )
-    role = normalize_role(row[2], row[1])
-    st.session_state.update(
-        logged_in=True,
-        username=username,
-        role=role,
-        is_admin=int(role != ROLE_USER),
-        login_fails=0,
-        must_change_pw=(password == 'admin123'),
-    )
-    if remember and cookies_supported():
-      issue_login_token(username)
+    weak = password == 'admin123'
+    if row[1] and row[3] and row[2] and smtp_configured():  # 2단계 인증
+      sent, reason = issue_email_code(
+          '2fa', username, row[2], '[배틀그라운드 닉네임 관리] 로그인 인증 코드',
+          '로그인을 시도하셨습니다.',
+      )
+      if not sent and reason != 'cooldown':
+        return False, '인증 메일을 보내지 못했습니다. 잠시 후 다시 시도하거나 관리자에게 문의하세요.'
+      st.session_state.twofa_pending = {
+          'username': username, 'remember': bool(remember), 'weak': weak,
+      }
+      return False, TWOFA_PENDING
+    open_session(username, remember, must_change_pw=weak)
+    notify_login(username)
     return True, ''
 
   note_auth_failure()
   return False, '아이디 또는 비밀번호가 올바르지 않습니다.'
+
+
+def finish_twofa(code):
+  pending = st.session_state.get('twofa_pending')
+  if not pending:
+    return False, '로그인을 처음부터 다시 시도해 주세요.'
+  locked = check_login_lock()
+  if locked:
+    return False, locked
+  ok, msg, _ = verify_email_code('2fa', pending['username'], code)
+  if not ok:
+    note_auth_failure()
+    with db() as conn:
+      still = conn.execute(
+          "SELECT 1 FROM email_codes WHERE purpose = '2fa' AND username = ?",
+          (pending['username'],),
+      ).fetchone()
+    if not still:  # 만료/시도 초과로 코드가 삭제됨 → 처음부터
+      st.session_state.twofa_pending = None
+    return False, msg
+  open_session(pending['username'], pending['remember'], pending['weak'])
+  st.session_state.twofa_pending = None
+  notify_login(pending['username'])
+  return True, ''
 
 
 # ---------- 로그인 상태 유지 (쿠키 + 서버 저장 토큰) ----------
@@ -621,6 +1030,7 @@ def logout():
       must_change_pw=False,
   )
   st.session_state.pop('extracted_nicknames', None)
+  st.session_state.pop('extracted_batches', None)
 
 
 def refresh_session_role():
@@ -670,8 +1080,8 @@ def email_verification_on():
   return get_setting('require_email_verify', '1') == '1' and smtp_configured()
 
 
-def send_email(to_addr, subject, body):
-  cfg = smtp_config()
+def send_email(to_addr, subject, body, cfg=None):
+  cfg = cfg or smtp_config()
   if not (cfg['host'] and cfg['user'] and cfg['password']):
     raise RuntimeError('SMTP가 설정되지 않았습니다.')
   msg = EmailMessage()
@@ -848,6 +1258,192 @@ def finish_signup(username, code):
     )
     conn.execute('DELETE FROM pending_signups WHERE username = ?', (username,))
   return True, '이메일 인증이 완료되어 가입되었습니다. 로그인해 주세요.'
+
+
+# ---------- 이메일 코드 공통 (비밀번호 찾기 · 이메일 등록 · 2단계 인증) ----------
+def issue_email_code(purpose, username, email, subject, intro):
+  """6자리 코드를 만들어 메일로 보낸다. (성공 여부, 실패 사유: '' | 'cooldown' | 'send_failed')."""
+  now = time.time()
+  with db() as conn:
+    row = conn.execute(
+        'SELECT sent_at FROM email_codes WHERE purpose = ? AND username = ?',
+        (purpose, username),
+    ).fetchone()
+  if row and now - row[0] < CODE_RESEND_SECONDS:
+    return False, 'cooldown'
+  code = f'{secrets.randbelow(10 ** 6):06d}'
+  salt = secrets.token_hex(8)
+  try:
+    send_email(
+        email, subject,
+        f'{intro}\n\n인증 코드: {code}\n\n{CODE_TTL_SECONDS // 60}분 안에 입력해 주세요.\n'
+        '본인이 요청하지 않았다면 이 메일을 무시하고, 필요하면 비밀번호를 변경하세요.',
+    )
+  except Exception as e:  # 상세 원인은 서버 콘솔에만 남긴다
+    print(f'[메일 발송 실패] {type(e).__name__}: {e}', flush=True)
+    return False, 'send_failed'
+  with db() as conn:
+    conn.execute(
+        'INSERT OR REPLACE INTO email_codes VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
+        (purpose, username, email, _code_hash(code, salt), salt,
+         now + CODE_TTL_SECONDS, now),
+    )
+  return True, ''
+
+
+def verify_email_code(purpose, username, code):
+  """(성공 여부, 메시지, 코드를 보냈던 이메일). 성공하면 코드는 즉시 삭제된다."""
+  code = (code or '').strip()
+  with db() as conn:
+    row = conn.execute(
+        'SELECT email, code_hash, salt, expires_at, attempts FROM email_codes'
+        ' WHERE purpose = ? AND username = ?',
+        (purpose, username),
+    ).fetchone()
+    if not row:
+      return False, '인증 코드를 먼저 요청해 주세요.', ''
+    email, code_hash, salt, expires_at, attempts = row
+    if time.time() > expires_at:
+      conn.execute('DELETE FROM email_codes WHERE purpose = ? AND username = ?', (purpose, username))
+      return False, '인증 코드가 만료되었습니다. 처음부터 다시 진행해 주세요.', ''
+    if attempts >= CODE_MAX_ATTEMPTS:
+      conn.execute('DELETE FROM email_codes WHERE purpose = ? AND username = ?', (purpose, username))
+      return False, '시도 횟수를 초과했습니다. 처음부터 다시 진행해 주세요.', ''
+    if not hmac.compare_digest(_code_hash(code, salt), code_hash):
+      conn.execute(
+          'UPDATE email_codes SET attempts = attempts + 1 WHERE purpose = ? AND username = ?',
+          (purpose, username),
+      )
+      return False, f'인증 코드가 올바르지 않습니다. (남은 시도 {CODE_MAX_ATTEMPTS - attempts - 1}회)', ''
+    conn.execute('DELETE FROM email_codes WHERE purpose = ? AND username = ?', (purpose, username))
+  return True, '', email
+
+
+# ---------- 비밀번호 찾기 ----------
+def request_password_reset(username, email):
+  """계정 존재 여부를 노출하지 않도록 항상 같은 응답을 준다. (성공 여부, 메시지)."""
+  if not smtp_configured():
+    return False, '이메일 발송이 설정되어 있지 않습니다. 관리자에게 문의해 주세요.'
+  now = time.time()
+  if now - st.session_state.last_mail_at < CODE_RESEND_SECONDS:
+    return False, '잠시 후 다시 시도해 주세요 (메일 재발송 대기 중).'
+  email = email.strip().lower()
+  with db() as conn:
+    row = conn.execute(
+        "SELECT 1 FROM users WHERE username = ? AND lower(email) = ? AND email != ''",
+        (username, email),
+    ).fetchone()
+  if row:
+    issue_email_code('reset', username, email, '[배틀그라운드 닉네임 관리] 비밀번호 재설정 코드', '비밀번호 재설정을 요청하셨습니다.')
+  st.session_state.last_mail_at = now
+  return True, '입력하신 정보가 일치하면 이메일로 코드를 보냈어요. (스팸함도 확인해 보세요)'
+
+
+def finish_password_reset(username, code, new_pw):
+  if len(new_pw) < 8:
+    return False, '새 비밀번호는 8자 이상이어야 합니다.'
+  ok, msg, _ = verify_email_code('reset', username, code)
+  if not ok:
+    return False, msg
+  with db() as conn:
+    conn.execute(
+        'UPDATE users SET password = ? WHERE username = ?',
+        (hash_password(new_pw), username),
+    )
+    conn.execute('DELETE FROM login_tokens WHERE username = ?', (username,))  # 모든 기기 로그아웃
+  return True, '비밀번호가 변경되었습니다. 새 비밀번호로 로그인해 주세요.'
+
+
+# ---------- 이메일 등록/인증 (기존 회원) · 보안 설정 ----------
+def get_security(username):
+  with db() as conn:
+    row = conn.execute(
+        'SELECT COALESCE(email, \'\'), COALESCE(email_verified, 0), COALESCE(twofa, 0),'
+        ' COALESCE(login_alert, 0) FROM users WHERE username = ?',
+        (username,),
+    ).fetchone()
+  keys = ('email', 'verified', 'twofa', 'alert')
+  return dict(zip(keys, row)) if row else dict.fromkeys(keys, '')
+
+
+def start_email_verify(username, email):
+  email = email.strip().lower()
+  if not smtp_configured():
+    return False, '이메일 발송이 설정되어 있지 않습니다. 관리자에게 문의해 주세요.'
+  if not EMAIL_RE.match(email) or len(email) > 100:
+    return False, '올바른 이메일 주소를 입력해 주세요.'
+  with db() as conn:
+    if conn.execute(
+        "SELECT 1 FROM users WHERE lower(email) = ? AND username != ? AND email != ''",
+        (email, username),
+    ).fetchone():
+      return False, '이미 다른 계정에서 사용 중인 이메일입니다.'
+  sent, reason = issue_email_code('email', username, email, '[배틀그라운드 닉네임 관리] 이메일 인증 코드', '이메일 등록을 요청하셨습니다.')
+  if sent:
+    return True, f'{mask_email(email)} 로 인증 코드를 보냈습니다.'
+  if reason == 'cooldown':
+    return False, '잠시 후 다시 시도해 주세요 (메일 재발송 대기 중).'
+  return False, '메일 발송에 실패했습니다. 주소를 확인하거나 관리자에게 문의하세요.'
+
+
+def finish_email_verify(username, code):
+  ok, msg, email = verify_email_code('email', username, code)
+  if not ok:
+    return False, msg
+  with db() as conn:
+    if conn.execute(
+        "SELECT 1 FROM users WHERE lower(email) = ? AND username != ? AND email != ''",
+        (email, username),
+    ).fetchone():
+      return False, '이미 다른 계정에서 사용 중인 이메일입니다.'
+    conn.execute(
+        'UPDATE users SET email = ?, email_verified = 1 WHERE username = ?',
+        (email, username),
+    )
+  return True, '✅ 이메일이 인증되었습니다.'
+
+
+def set_security_flag(username, field, enabled):
+  """2단계 인증(twofa) / 로그인 알림(login_alert) 켜고 끄기. (성공 여부, 메시지)."""
+  if field not in ('twofa', 'login_alert'):
+    return False, '알 수 없는 설정입니다.'
+  if enabled:
+    sec = get_security(username)
+    if not (sec['email'] and sec['verified']):
+      return False, '먼저 이메일을 등록하고 인증해 주세요.'
+    if not smtp_configured():
+      return False, '이메일 발송이 설정되어 있지 않아 켤 수 없습니다.'
+  with db() as conn:
+    conn.execute(f'UPDATE users SET {field} = ? WHERE username = ?', (int(enabled), username))
+  return True, '설정을 저장했습니다.'
+
+
+def _send_quiet(to_addr, subject, body, cfg):
+  try:
+    send_email(to_addr, subject, body, cfg=cfg)
+  except Exception as e:
+    print(f'[알림 메일 실패] {type(e).__name__}: {e}', flush=True)
+
+
+def notify_login(username):
+  """로그인 알림 메일 (설정한 회원만, 백그라운드 발송)."""
+  sec = get_security(username)
+  if not (sec['alert'] and sec['verified'] and sec['email'] and smtp_configured()):
+    return
+  try:
+    ua = (st.context.headers.get('User-Agent', '') or '')[:120]
+  except Exception:
+    ua = ''
+  body = (
+      f'{now_str()} 에 계정 {username} 으로 새 로그인이 있었습니다.\n'
+      f'접속 기기 정보: {ua or "알 수 없음"}\n\n'
+      '본인이 아니라면 즉시 비밀번호를 변경하고 "모든 기기에서 로그아웃"을 누르세요.'
+  )
+  threading.Thread(
+      target=_send_quiet,
+      args=(sec['email'], '[배틀그라운드 닉네임 관리] 새 로그인 알림', body, smtp_config()),
+      daemon=True,
+  ).start()
 
 
 # ---------- 최종관리자 최초 설정 ----------
@@ -1264,6 +1860,12 @@ def save_nicknames(username, entries, source):
       )
       existing[key] = (cur.lastrowid, e['clan'])
       added += 1
+    if len(entries) >= 2:  # 한 번에 저장한 2명 이상 = 한 판(스쿼드)
+      sid = secrets.token_hex(6)
+      conn.executemany(
+          'INSERT INTO squad_members VALUES (?, ?, ?, ?, ?)',
+          [(sid, username, e['nickname'], e['clan'], stamp) for e in entries],
+      )
   return added, updated, skipped
 
 
@@ -1530,16 +2132,19 @@ def load_recent_nicknames(limit=20):
 
 
 def recent_view(df):
+  nmap = notes_map(st.session_state.get('username', ''))
   return pd.DataFrame({
       '닉네임': df['nickname'],
       '클랜': df['clan'],
       '등록 시각': df['created_at'],
       '경과': df['created_at'].map(time_ago),
       '등록자': df['username'],
+      '내 메모': [note_badge(nmap, n) for n in df['nickname']],
   })
 
 
 def search_view(df):
+  nmap = notes_map(st.session_state.get('username', ''))
   return pd.DataFrame({
       '닉네임': df['nickname'],
       '클랜': df['clan'],
@@ -1547,6 +2152,7 @@ def search_view(df):
       '경과': df['created_at'].map(time_ago),
       '등록 회원 수': df['cnt'],
       '등록자': df['username'],
+      '내 메모': [note_badge(nmap, n) for n in df['nickname']],
       '최초 등록': df['first_at'],
   })
 
@@ -1557,7 +2163,7 @@ def show_recent_nicknames(limit=20):
   if df.empty:
     st.caption('아직 등록된 닉네임이 없습니다.')
   else:
-    nick_link_table(recent_view(df), nick_col='닉네임', mobile_cols=['경과', '등록자'])
+    nick_link_table(recent_view(df), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
 
 
 def update_nickname(actor, is_admin, row_id, clan, nick):
@@ -1572,11 +2178,11 @@ def update_nickname(actor, is_admin, row_id, clan, nick):
     return False, f'클랜 태그는 {MAX_CLAN_LEN}자 이하여야 합니다.'
   with db() as conn:
     row = conn.execute(
-        'SELECT username FROM nicknames WHERE id = ?', (row_id,)
+        'SELECT username, nickname FROM nicknames WHERE id = ?', (row_id,)
     ).fetchone()
     if not row:
       return False, '대상 닉네임을 찾을 수 없습니다.'
-    owner = row[0]
+    owner, old_nick = row[0], row[1]
     if owner != actor and not is_admin:
       return False, '본인이 등록한 닉네임만 수정할 수 있습니다.'
     if conn.execute(
@@ -1589,6 +2195,7 @@ def update_nickname(actor, is_admin, row_id, clan, nick):
         'UPDATE nicknames SET clan = ?, nickname = ? WHERE id = ?',
         (clan, nick, row_id),
     )
+    propagate_rename(conn, owner, old_nick, nick, clan)
   if owner != actor:
     log_admin('닉네임 수정', owner, f'#{row_id} → {entry_label(clan, nick)}')
   return True, f'✅ {entry_label(clan, nick)} 로 수정했습니다.'
@@ -1599,6 +2206,440 @@ def stats_button(label, url):
     st.link_button(label, url)
   except AttributeError:  # 구버전 Streamlit
     st.markdown(f'[{label}]({url})')
+
+
+# ==========================================
+# 6-2. 함께한 사람 · 메모/즐겨찾기 · 글자 혼동 · 전적 API · 시간 통계
+# ==========================================
+PRESET_TAGS = ['👍 팀원 좋음', '⚠️ 주의', '🚫 핵 의심', '🏆 고수', '🤝 친구', '🔁 또 같이하고 싶음']
+MAX_TAGS = 5
+MAX_TAG_LEN = 20
+MAX_NOTE_LEN = 300
+
+
+def nick_key(nickname):
+  return (nickname or '').strip().lower()
+
+
+# ---------- 함께한 사람 (스쿼드 기록) ----------
+def get_my_nickname(username):
+  with db() as conn:
+    row = conn.execute(
+        "SELECT COALESCE(my_nickname, '') FROM users WHERE username = ?", (username,)
+    ).fetchone()
+  return row[0] if row else ''
+
+
+def set_my_nickname(username, nickname):
+  with db() as conn:
+    conn.execute(
+        'UPDATE users SET my_nickname = ? WHERE username = ?',
+        ((nickname or '').strip()[:MAX_NICK_LEN], username),
+    )
+
+
+def top_partners(owner, exclude='', limit=30):
+  """내 기록에서 가장 자주 등장한 닉네임."""
+  sql = (
+      "SELECT MAX(nickname) AS nickname, MAX(COALESCE(clan, '')) AS clan,"
+      ' COUNT(DISTINCT squad_id) AS games, MAX(created_at) AS last_at'
+      ' FROM squad_members WHERE owner = ?'
+  )
+  params = [owner]
+  if exclude:
+    sql += ' AND lower(nickname) != lower(?)'
+    params.append(exclude)
+  sql += ' GROUP BY lower(nickname) ORDER BY games DESC, last_at DESC LIMIT ?'
+  params.append(limit)
+  with db() as conn:
+    return pd.read_sql(sql, conn, params=params)
+
+
+def partners_of(owner, nickname, limit=30):
+  """특정 닉네임과 같은 판에 있었던 사람들."""
+  with db() as conn:
+    return pd.read_sql(
+        "SELECT MAX(m2.nickname) AS nickname, MAX(COALESCE(m2.clan, '')) AS clan,"
+        ' COUNT(DISTINCT m2.squad_id) AS games, MAX(m2.created_at) AS last_at'
+        ' FROM squad_members m1 JOIN squad_members m2'
+        '   ON m1.squad_id = m2.squad_id AND lower(m2.nickname) != lower(m1.nickname)'
+        ' WHERE m1.owner = ? AND lower(m1.nickname) = lower(?)'
+        ' GROUP BY lower(m2.nickname) ORDER BY games DESC, last_at DESC LIMIT ?',
+        conn,
+        params=(owner, nickname, limit),
+    )
+
+
+def games_with(owner, nickname):
+  with db() as conn:
+    return conn.execute(
+        'SELECT COUNT(DISTINCT squad_id) FROM squad_members'
+        ' WHERE owner = ? AND lower(nickname) = lower(?)',
+        (owner, nickname),
+    ).fetchone()[0]
+
+
+def recent_squads(owner, nickname='', limit=10):
+  """최근 스쿼드 목록 [{'time', 'members': [(clan, nick)]}] (nickname이 있으면 그 사람이 있던 판만)."""
+  where, params = 'WHERE owner = ?', [owner]
+  if nickname:
+    where += (
+        ' AND squad_id IN (SELECT squad_id FROM squad_members'
+        ' WHERE owner = ? AND lower(nickname) = lower(?))'
+    )
+    params += [owner, nickname]
+  sql = (
+      "SELECT squad_id, MAX(created_at) AS ts,"
+      " GROUP_CONCAT(COALESCE(clan, '') || '|' || nickname, ';;')"
+      f' FROM squad_members {where} GROUP BY squad_id ORDER BY ts DESC LIMIT ?'
+  )
+  with db() as conn:
+    rows = conn.execute(sql, params + [limit]).fetchall()
+  squads = []
+  for _sid, ts, members in rows:
+    pairs = []
+    for part in (members or '').split(';;'):
+      clan, _, nick = part.partition('|')
+      if nick:
+        pairs.append((clan, nick))
+    squads.append({'time': ts, 'members': pairs})
+  return squads
+
+
+def squad_markdown(squads, platform):
+  lines = []
+  for sq in squads:
+    names = ' · '.join(
+        (f'`{c.replace(chr(96), "")}` ' if c else '')
+        + f'[{md_escape(n)}]({stats_url(n, platform)})'
+        for c, n in sq['members']
+    )
+    lines.append(f"- **{_short_time(sq['time'])}** — {names}")
+  return '\n'.join(lines)
+
+
+def propagate_rename(conn, owner, old_nick, new_nick, new_clan):
+  """닉네임을 고쳤을 때 스쿼드 기록과 개인 메모의 이름도 함께 바꾼다."""
+  conn.execute(
+      'UPDATE squad_members SET nickname = ?, clan = ?'
+      ' WHERE owner = ? AND lower(nickname) = lower(?)',
+      (new_nick, new_clan, owner, old_nick),
+  )
+  old_key, new_key = nick_key(old_nick), nick_key(new_nick)
+  if old_key != new_key and conn.execute(
+      'SELECT 1 FROM nick_notes WHERE owner = ? AND nick_key = ?', (owner, new_key)
+  ).fetchone() is None:
+    conn.execute(
+        'UPDATE nick_notes SET nick_key = ?, nickname = ? WHERE owner = ? AND nick_key = ?',
+        (new_key, new_nick, owner, old_key),
+    )
+
+
+def cleanup_squads():
+  """삭제된 닉네임이 남긴 스쿼드 기록 정리."""
+  with db() as conn:
+    conn.execute(
+        'DELETE FROM squad_members WHERE NOT EXISTS ('
+        ' SELECT 1 FROM nicknames n WHERE n.username = squad_members.owner'
+        ' AND lower(n.nickname) = lower(squad_members.nickname))'
+    )
+    conn.execute(
+        'DELETE FROM squad_members WHERE squad_id IN ('
+        ' SELECT squad_id FROM squad_members GROUP BY squad_id HAVING COUNT(*) < 2)'
+    )
+
+
+# ---------- 개인 메모 · 태그 · 즐겨찾기 ----------
+def clean_tags(tags):
+  out = []
+  for t in tags:
+    t = (t or '').strip()
+    if t and len(t) <= MAX_TAG_LEN and t not in out:
+      out.append(t)
+  return out[:MAX_TAGS]
+
+
+def parse_tags(preset_selected, extra_text):
+  extra = (extra_text or '').replace('，', ',').split(',')
+  return clean_tags(list(preset_selected) + extra)
+
+
+def get_note(owner, nickname):
+  with db() as conn:
+    row = conn.execute(
+        'SELECT nickname, favorite, tags, note, updated_at FROM nick_notes'
+        ' WHERE owner = ? AND nick_key = ?',
+        (owner, nick_key(nickname)),
+    ).fetchone()
+  if not row:
+    return None
+  return {
+      'nickname': row[0], 'favorite': bool(row[1]),
+      'tags': [t for t in (row[2] or '').split(',') if t],
+      'note': row[3] or '', 'updated_at': row[4],
+  }
+
+
+def save_note(owner, nickname, favorite, tags, note):
+  nickname = (nickname or '').strip()
+  if not nickname:
+    return False, '닉네임을 입력해 주세요.'
+  if len(nickname) > MAX_NICK_LEN:
+    return False, f'닉네임은 {MAX_NICK_LEN}자 이하여야 합니다.'
+  tags = clean_tags(tags)
+  note = (note or '').strip()[:MAX_NOTE_LEN]
+  with db() as conn:
+    if not favorite and not tags and not note:
+      conn.execute(
+          'DELETE FROM nick_notes WHERE owner = ? AND nick_key = ?',
+          (owner, nick_key(nickname)),
+      )
+      return True, '즐겨찾기·태그·메모가 모두 비어 있어 항목을 정리했어요.'
+    conn.execute(
+        'INSERT OR REPLACE INTO nick_notes VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (owner, nick_key(nickname), nickname, int(bool(favorite)),
+         ','.join(tags), note, now_str()),
+    )
+  return True, f'✅ {nickname} 메모를 저장했습니다.'
+
+
+def delete_note(owner, nickname):
+  with db() as conn:
+    conn.execute(
+        'DELETE FROM nick_notes WHERE owner = ? AND nick_key = ?',
+        (owner, nick_key(nickname)),
+    )
+
+
+def load_notes(owner):
+  with db() as conn:
+    return pd.read_sql(
+        'SELECT nickname, favorite, tags, note, updated_at FROM nick_notes'
+        ' WHERE owner = ? ORDER BY favorite DESC, updated_at DESC',
+        conn,
+        params=(owner,),
+    )
+
+
+def notes_map(owner):
+  df = load_notes(owner)
+  return {
+      nick_key(r.nickname): {
+          'favorite': bool(r.favorite),
+          'tags': [t for t in (r.tags or '').split(',') if t],
+          'note': r.note or '',
+      }
+      for r in df.itertuples()
+  }
+
+
+def note_badge(nmap, nickname):
+  """표에 보여줄 한 줄 요약: ⭐ 태그 메모앞부분."""
+  n = nmap.get(nick_key(nickname))
+  if not n:
+    return ''
+  parts = ['⭐'] if n['favorite'] else []
+  parts += n['tags'][:2]
+  if n['note']:
+    parts.append(n['note'][:18] + ('…' if len(n['note']) > 18 else ''))
+  return ' '.join(parts)
+
+
+# ---------- 글자 혼동 도우미 ----------
+CONFUSABLE_CANON = {
+    'l': 'l', 'I': 'l', '1': 'l', '|': 'l',
+    'O': '0', 'o': '0', '0': '0',
+    'S': '5', '5': '5', 'B': '8', '8': '8', 'Z': '2', '2': '2',
+}
+CONFUSABLE_ALTS = {
+    'l': 'I1', 'I': 'l1', '1': 'lI', 'O': '0', '0': 'O', 'o': '0',
+    'S': '5', '5': 'S', 'B': '8', '8': 'B', 'Z': '2', '2': 'Z',
+}
+
+
+def confusable_key(text):
+  """헷갈리는 글자(l/I/1, O/0, S/5, B/8, Z/2)를 같은 것으로 취급한 비교 키."""
+  return ''.join(CONFUSABLE_CANON.get(c, c.lower()) for c in text)
+
+
+def confusable_variants(nickname, limit=20):
+  """헷갈리는 글자를 하나씩 바꾼 후보 (원본 제외)."""
+  out = []
+  for i, ch in enumerate(nickname):
+    for alt in CONFUSABLE_ALTS.get(ch, ''):
+      cand = nickname[:i] + alt + nickname[i + 1:]
+      if cand != nickname and cand not in out:
+        out.append(cand)
+        if len(out) >= limit:
+          return out
+  return out
+
+
+def find_similar_in_db(nickname, limit=5):
+  """철자만 헷갈리는(같은 길이, 같은 키) 이미 등록된 닉네임 [(닉네임, 클랜)]."""
+  key = confusable_key(nickname)
+  with db() as conn:
+    rows = conn.execute(
+        "SELECT DISTINCT nickname, COALESCE(clan, '') FROM nicknames WHERE length(nickname) = ?",
+        (len(nickname),),
+    ).fetchall()
+  found = {}
+  for n, c in rows:
+    if n != nickname and confusable_key(n) == key and (n not in found or (c and not found[n])):
+      found[n] = c  # 같은 닉네임은 한 번만 (클랜 정보가 있는 쪽 우선)
+  return list(found.items())[:limit]
+
+
+# ---------- PUBG 공식 API 전적 요약 (키 필요) ----------
+PUBG_API_BASE = 'https://api.pubg.com'
+PUBG_MODES = [
+    ('squad-fpp', '스쿼드 1인칭'), ('squad', '스쿼드 3인칭'),
+    ('duo-fpp', '듀오 1인칭'), ('duo', '듀오 3인칭'),
+    ('solo-fpp', '솔로 1인칭'), ('solo', '솔로 3인칭'),
+]
+
+
+def pubg_api_key():
+  return get_secret('PUBG_API_KEY') or decrypt_secret(get_setting('pubg_api_key', ''))
+
+
+def pubg_request(path, api_key):
+  req = urllib.request.Request(
+      PUBG_API_BASE + path,
+      headers={'Authorization': f'Bearer {api_key}', 'Accept': 'application/vnd.api+json'},
+  )
+  with urllib.request.urlopen(req, timeout=10) as resp:
+    return json.loads(resp.read().decode('utf-8'))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_pubg_summary(nickname, shard, _api_key):
+  """모드별 평생 전적 요약 DataFrame. (10분 캐시: API 호출 한도 절약)"""
+  players = pubg_request(
+      f'/shards/{shard}/players?filter[playerNames]={quote(nickname, safe="")}', _api_key
+  )
+  items = players.get('data') or []
+  if not items:
+    raise LookupError('플레이어를 찾을 수 없습니다.')
+  life = pubg_request(f'/shards/{shard}/players/{items[0]["id"]}/seasons/lifetime', _api_key)
+  modes = life['data']['attributes']['gameModeStats']
+  rows = []
+  for key, label in PUBG_MODES:
+    m = modes.get(key) or {}
+    rounds = m.get('roundsPlayed', 0)
+    if not rounds:
+      continue
+    wins, kills = m.get('wins', 0), m.get('kills', 0)
+    rows.append({
+        '모드': label,
+        '판수': rounds,
+        '승리': wins,
+        'TOP10': m.get('top10s', 0),
+        '킬': kills,
+        'K/D(추정)': round(kills / max(1, rounds - wins), 2),
+        '평균 딜량': round(m.get('damageDealt', 0) / rounds),
+        '헤드샷 %': round(m.get('headshotKills', 0) / kills * 100, 1) if kills else 0.0,
+    })
+  return pd.DataFrame(rows)
+
+
+def pubg_friendly_error(exc):
+  if isinstance(exc, LookupError):
+    return str(exc) + ' (닉네임 대소문자와 플랫폼을 확인하세요)'
+  if isinstance(exc, urllib.error.HTTPError):
+    return {
+        401: 'PUBG API 키가 올바르지 않습니다.',
+        404: '플레이어를 찾을 수 없습니다. (닉네임 대소문자와 플랫폼을 확인하세요)',
+        429: 'API 호출 한도를 초과했어요. 1분 뒤 다시 시도하세요.',
+    }.get(exc.code, f'PUBG API 오류 ({exc.code})')
+  return f'전적을 불러오지 못했습니다: {type(exc).__name__}'
+
+
+# ---------- 시간대별 · 요일별 통계 ----------
+def load_time_stats():
+  with db() as conn:
+    hours = dict(conn.execute(
+        "SELECT CAST(strftime('%H', created_at) AS INTEGER), COUNT(*) FROM nicknames"
+        ' WHERE created_at IS NOT NULL GROUP BY 1'
+    ).fetchall())
+    days = dict(conn.execute(
+        "SELECT CAST(strftime('%w', created_at) AS INTEGER), COUNT(*) FROM nicknames"
+        ' WHERE created_at IS NOT NULL GROUP BY 1'
+    ).fetchall())
+  hdf = pd.DataFrame(
+      {'등록 수': [hours.get(h, 0) for h in range(24)]},
+      index=[f'{h:02d}시' for h in range(24)],
+  )
+  names = ['일', '월', '화', '수', '목', '금', '토']  # strftime %w: 0 = 일요일
+  order = [1, 2, 3, 4, 5, 6, 0]
+  ddf = pd.DataFrame(
+      {'등록 수': [days.get(d, 0) for d in order]},
+      index=[names[d] + '요일' for d in order],
+  )
+  return hdf, ddf
+
+
+# ---------- 화면용 보조 함수 ----------
+def prepare_target(img, use_crop, crop_x, crop_y, scale_label, contrast, sharpen):
+  """인식에 쓸 이미지(영역 자르기 + 업스케일/보정)를 만든다."""
+  region = crop_region(img, crop_x, crop_y) if use_crop else limit_size(img, MAX_FULL_SIDE)
+  return enhance_image(region, UPSCALE_OPTIONS[scale_label], contrast, sharpen)
+
+
+def validate_entries(entries):
+  if len(entries) > MAX_SQUAD:
+    return f'한 번에 최대 {MAX_SQUAD}명까지만 저장할 수 있습니다.'
+  if any(len(e['nickname']) > MAX_NICK_LEN for e in entries):
+    return f'닉네임은 {MAX_NICK_LEN}자 이하여야 합니다.'
+  if any(len(e['clan']) > MAX_CLAN_LEN for e in entries):
+    return f'클랜 태그는 {MAX_CLAN_LEN}자 이하여야 합니다.'
+  return ''
+
+
+def apply_nick_choice(pc_key, clan_key, m_key, mobile, nick, clan):
+  """'이걸로 바꾸기' 버튼: 입력칸의 값을 DB에 있는 철자로 교체 (버튼 콜백)."""
+  if mobile:
+    st.session_state[m_key] = entry_label(clan, nick)
+  else:
+    st.session_state[pc_key] = nick
+    if clan:
+      st.session_state[clan_key] = clan
+
+
+def nickname_tools(nickname, key_prefix):
+  """닉네임 하나에 대한 보조 도구: 비슷한 DB 닉네임 · 헷갈리는 글자 후보 · 전적 요약(API)."""
+  nickname = (nickname or '').strip()
+  if not nickname:
+    return
+  plat = current_platform()
+  similar = find_similar_in_db(nickname)
+  if similar:
+    st.info('DB에 철자만 다른 닉네임이 있어요: ' + ', '.join(f'`{n}`' for n, _ in similar))
+  variants = confusable_variants(nickname)
+  if variants:
+    with st.expander('🔤 헷갈리는 글자 후보로 전적 확인'):
+      st.caption(
+          'l/I/1, O/0, S/5, B/8, Z/2 처럼 비슷한 글자를 바꾼 후보예요.'
+          ' 눌러서 전적 페이지가 열리면 그 철자가 맞는 거예요.'
+      )
+      st.markdown(' · '.join(f'[{md_escape(v)}]({stats_url(v, plat)})' for v in variants))
+  api_key = pubg_api_key()
+  if api_key:
+    sum_key = f'pubg_sum_{key_prefix}_{plat}_{nickname}'
+    if st.button('📊 전적 요약 불러오기', key=f'pubg_btn_{key_prefix}'):
+      try:
+        st.session_state[sum_key] = fetch_pubg_summary(nickname, plat, api_key)
+      except Exception as e:
+        st.session_state[sum_key] = pubg_friendly_error(e)
+    result = st.session_state.get(sum_key)
+    if isinstance(result, pd.DataFrame):
+      if result.empty:
+        st.caption('모드별 기록이 없어요.')
+      else:
+        show_df(result)
+        st.caption('K/D는 (킬 ÷ 승리하지 못한 판 수)로 추정한 값이에요. 출처: PUBG 공식 API (평생 기록).')
+    elif isinstance(result, str):
+      st.error(result)
 
 
 # ==========================================
@@ -1671,6 +2712,19 @@ def admin_reset_password(target):
   return True, f'🔑 **{target}** 님의 임시 비밀번호: `{temp}` (이 알림을 닫으면 다시 볼 수 없습니다)'
 
 
+def admin_disable_twofa(target):
+  """이메일을 잃어버린 회원이 잠기지 않도록 2단계 인증을 해제한다."""
+  require_admin()
+  with db() as conn:
+    _, err = _check_manageable(conn, target)
+    if err:
+      return False, err
+    conn.execute('UPDATE users SET twofa = 0 WHERE username = ?', (target,))
+    conn.execute('DELETE FROM email_codes WHERE username = ?', (target,))
+  log_admin('2단계 인증 해제', target)
+  return True, f'{target} 님의 2단계 인증을 해제했습니다.'
+
+
 def admin_clear_keys(target):
   require_admin()
   with db() as conn:
@@ -1693,14 +2747,17 @@ def admin_delete_user(target, delete_nicks):
     conn.execute('DELETE FROM user_keys WHERE username = ?', (target,))
     conn.execute('DELETE FROM pending_signups WHERE username = ?', (target,))
     conn.execute('DELETE FROM login_tokens WHERE username = ?', (target,))
+    conn.execute('DELETE FROM email_codes WHERE username = ?', (target,))
     deleted = conn.execute(
         'DELETE FROM users WHERE username = ?', (target,)
     ).rowcount
+    conn.execute('DELETE FROM nick_notes WHERE owner = ?', (target,))
     removed = 0
     if delete_nicks:
       removed = conn.execute(
           'DELETE FROM nicknames WHERE username = ?', (target,)
       ).rowcount
+      conn.execute('DELETE FROM squad_members WHERE owner = ?', (target,))
   if not deleted:
     return False, '계정을 삭제하지 못했습니다.'
   log_admin('계정 삭제', target, f'닉네임 {removed}개 함께 삭제' if delete_nicks else '닉네임 유지')
@@ -1781,7 +2838,7 @@ def admin_update_nicknames(rows):
       clan = (clan or '').strip(' []()')
       nick = (nick or '').strip()
       owner = conn.execute(
-          'SELECT username FROM nicknames WHERE id = ?', (row_id,)
+          'SELECT username, nickname FROM nicknames WHERE id = ?', (row_id,)
       ).fetchone()
       if (
           not owner
@@ -1800,6 +2857,7 @@ def admin_update_nicknames(rows):
           'UPDATE nicknames SET clan = ?, nickname = ? WHERE id = ?',
           (clan, nick, row_id),
       )
+      propagate_rename(conn, owner[0], owner[1], nick, clan)
       updated += 1
   if updated:
     log_admin('닉네임 수정', '', f'{updated}건')
@@ -1810,6 +2868,7 @@ def admin_delete_nicknames(ids):
   require_admin()
   with db() as conn:
     conn.executemany('DELETE FROM nicknames WHERE id = ?', [(i,) for i in ids])
+  cleanup_squads()
   log_admin('닉네임 삭제', '', f'{len(ids)}건 (id: {", ".join(map(str, ids[:20]))})')
 
 
@@ -1870,7 +2929,7 @@ def load_user_overview():
   with db() as conn:
     df = pd.read_sql(
         'SELECT u.username, u.role, u.is_admin, COALESCE(u.email, \'\') AS email,'
-        ' COALESCE(u.email_verified, 0) AS email_verified, u.created_at,'
+        ' COALESCE(u.email_verified, 0) AS email_verified, COALESCE(u.twofa, 0) AS twofa, u.created_at,'
         ' (SELECT COUNT(*) FROM nicknames n WHERE n.username = u.username) AS nick_count,'
         ' (SELECT MAX(created_at) FROM nicknames n WHERE n.username = u.username) AS last_collected,'
         ' (SELECT COUNT(*) FROM user_keys k WHERE k.username = u.username) AS key_count'
@@ -1884,17 +2943,7 @@ def load_user_overview():
 def make_db_backup():
   """SQLite 백업 API로 일관된 스냅샷을 만들어 bytes로 반환한다."""
   require_admin()
-  with tempfile.TemporaryDirectory() as tmp:
-    path = os.path.join(tmp, 'backup.db')
-    src = sqlite3.connect(DB_FILE)
-    dst = sqlite3.connect(path)
-    try:
-      src.backup(dst)
-    finally:
-      dst.close()
-      src.close()
-    with open(path, 'rb') as f:
-      return f.read()
+  return snapshot_db_bytes()
 
 
 SQLITE_MAGIC = b'SQLite format 3\x00'
@@ -1971,6 +3020,9 @@ def env_status():
   ], columns=['항목', '상태'])
 
 
+sync_bootstrap()  # 재시작 직후라면 원격 스냅샷에서 자동 복원
+
+
 # ==========================================
 # 7. 로그인 화면
 # ==========================================
@@ -1996,26 +3048,78 @@ if not st.session_state.logged_in:
   with tab_login:
     st.subheader('로그인')
     st.caption('관리 기능은 권한이 있는 계정으로 로그인했을 때만 표시됩니다.')
-    with st.form('login_form'):
-      u_input = text_input_ac('아이디', 'username')
-      p_input = text_input_ac('비밀번호', 'current-password', type='password')
-      remember = (
-          st.checkbox(
-              f'로그인 상태 유지 (이 기기에서 최대 {REMEMBER_MAX_DAYS}일)',
-              value=False,
-              help=f'새로고침하거나 브라우저를 껐다 켜도 로그인이 유지돼요. '
-              f'{REMEMBER_IDLE_DAYS}일 동안 접속하지 않거나 {REMEMBER_MAX_DAYS}일이 지나면 '
-              '다시 로그인해야 해요. 공용 PC에서는 체크하지 마세요.',
-          )
-          if cookies_supported()
-          else False
-      )
-      if st.form_submit_button('로그인'):
-        ok, msg = login_user(u_input.strip(), p_input, remember)
+    twofa_pend = st.session_state.get('twofa_pending')
+    if twofa_pend:
+      st.info('📧 가입한 이메일로 보낸 6자리 인증 코드를 입력해 주세요.')
+      with st.form('twofa_form'):
+        twofa_code = st.text_input('인증 코드 (6자리)', max_chars=6)
+        twofa_submit = st.form_submit_button('확인')
+      if twofa_submit:
+        ok, msg = finish_twofa(twofa_code)
         if ok:
           st.rerun()
         else:
           st.error(msg)
+      if st.button('↩︎ 처음부터 다시', key='twofa_cancel'):
+        st.session_state.twofa_pending = None
+        st.rerun()
+    else:
+      with st.form('login_form'):
+        u_input = text_input_ac('아이디', 'username')
+        p_input = text_input_ac('비밀번호', 'current-password', type='password')
+        remember = (
+            st.checkbox(
+                f'로그인 상태 유지 (이 기기에서 최대 {REMEMBER_MAX_DAYS}일)',
+                value=False,
+                help=f'새로고침하거나 브라우저를 껐다 켜도 로그인이 유지돼요. '
+                f'{REMEMBER_IDLE_DAYS}일 동안 접속하지 않거나 {REMEMBER_MAX_DAYS}일이 지나면 '
+                '다시 로그인해야 해요. 공용 PC에서는 체크하지 마세요.',
+            )
+            if cookies_supported()
+            else False
+        )
+        if st.form_submit_button('로그인'):
+          ok, msg = login_user(u_input.strip(), p_input, remember)
+          if ok or msg == TWOFA_PENDING:
+            st.rerun()
+          else:
+            st.error(msg)
+
+      with st.expander('🔑 비밀번호를 잊으셨나요?'):
+        reset_user = st.session_state.get('reset_pending', '')
+        if reset_user:
+          st.info('📧 이메일로 보낸 6자리 코드와 새 비밀번호를 입력해 주세요.')
+          with st.form('reset_form'):
+            rs_code = st.text_input('인증 코드 (6자리)', max_chars=6)
+            rs_pw1 = st.text_input('새 비밀번호 (8자 이상)', type='password')
+            rs_pw2 = st.text_input('새 비밀번호 확인', type='password')
+            rs_submit = st.form_submit_button('비밀번호 변경')
+          if rs_submit:
+            if rs_pw1 != rs_pw2:
+              st.error('새 비밀번호가 일치하지 않습니다.')
+            else:
+              ok, msg = finish_password_reset(reset_user, rs_code, rs_pw1)
+              if ok:
+                st.session_state.reset_pending = ''
+                flash(msg)
+                st.rerun()
+              else:
+                st.error(msg)
+          if st.button('↩︎ 처음부터 다시', key='reset_cancel'):
+            st.session_state.reset_pending = ''
+            st.rerun()
+        else:
+          st.caption('가입할 때(또는 보안 설정에서) 등록한 이메일로 인증 코드를 보내드려요.')
+          with st.form('reset_request_form'):
+            rq_user = st.text_input('아이디')
+            rq_email = st.text_input('가입한 이메일')
+            if st.form_submit_button('인증 코드 받기'):
+              ok, msg = request_password_reset(rq_user.strip(), rq_email)
+              if ok:
+                st.session_state.reset_pending = rq_user.strip()
+                st.rerun()
+              else:
+                st.error(msg)
 
   with tab_register:
     st.subheader('신규 회원가입')
@@ -2179,6 +3283,54 @@ with st.sidebar.expander('🔐 로그인 관리'):
     logout()
     st.rerun()
 
+with st.sidebar.expander('📧 이메일 · 보안'):
+  sec = get_security(username)
+  if sec['email']:
+    st.caption(f"이메일: {mask_email(sec['email'])} " + ('✅ 인증됨' if sec['verified'] else '(미인증)'))
+  else:
+    st.caption('등록된 이메일이 없어요. 등록하면 **비밀번호 찾기**와 **2단계 인증**을 쓸 수 있어요.')
+  if not smtp_configured():
+    st.caption('※ 메일 발송이 설정되지 않아 이 기능들을 쓸 수 없어요 (관리자에게 문의).')
+  else:
+    if st.session_state.get('email_verify_pending'):
+      st.info('📧 이메일로 보낸 6자리 코드를 입력해 주세요.')
+      with st.form('email_verify_form'):
+        ev_code = st.text_input('인증 코드 (6자리)', max_chars=6)
+        ev_submit = st.form_submit_button('인증')
+      if ev_submit:
+        ok, msg = finish_email_verify(username, ev_code)
+        if ok:
+          st.session_state.email_verify_pending = False
+          flash(msg)
+          st.rerun()
+        else:
+          st.error(msg)
+      if st.button('취소', key='email_verify_cancel'):
+        st.session_state.email_verify_pending = False
+        st.rerun()
+    else:
+      with st.form('email_register_form'):
+        ev_email = st.text_input('이메일 등록/변경', placeholder='name@example.com')
+        if st.form_submit_button('인증 코드 보내기'):
+          ok, msg = start_email_verify(username, ev_email)
+          if ok:
+            st.session_state.email_verify_pending = True
+            st.rerun()
+          else:
+            st.error(msg)
+    st.divider()
+    tw_new = st.toggle('🔒 로그인 시 이메일 인증 코드 (2단계 인증)', value=bool(sec['twofa']), disabled=not sec['verified'], key='toggle_twofa')
+    if tw_new != bool(sec['twofa']):
+      ok, msg = set_security_flag(username, 'twofa', tw_new)
+      flash(msg, 'success' if ok else 'error')
+      st.rerun()
+    al_new = st.toggle('🔔 새 로그인 알림 메일', value=bool(sec['alert']), disabled=not sec['verified'], key='toggle_alert')
+    if al_new != bool(sec['alert']):
+      ok, msg = set_security_flag(username, 'login_alert', al_new)
+      flash(msg, 'success' if ok else 'error')
+      st.rerun()
+    st.caption('로그인 상태 유지(자동 로그인)로 들어올 때는 2단계 인증을 다시 묻지 않아요.')
+
 st.sidebar.divider()
 st.sidebar.selectbox(
     '🔍 전적 검색 플랫폼',
@@ -2198,13 +3350,16 @@ st.sidebar.selectbox(
 # ==========================================
 show_flash()
 
-tab_labels = ['📸 이미지 수집 및 관리', '🔎 닉네임 검색', '📊 내 닉네임 목록']
+tab_labels = [
+    '📸 이미지 수집 및 관리', '🔎 닉네임 검색', '🤝 함께한 사람',
+    '⭐ 즐겨찾기·메모', '📊 내 닉네임 목록',
+]
 if st.session_state.is_admin:
   tab_labels.append('👑 관리자 패널')
 _tabs = st.tabs(tab_labels)
-main_tab1, main_tab_search, main_tab2 = _tabs[:3]
+main_tab1, main_tab_search, main_tab_squad, main_tab_notes, main_tab2 = _tabs[:5]
 if st.session_state.is_admin:
-  main_tab3 = _tabs[3]
+  main_tab3 = _tabs[5]
 
 # ------------------------------------------
 # [탭 1] 이미지 수집 및 관리
@@ -2282,19 +3437,25 @@ with main_tab1:
   )
   st.caption(f'🤖 현재 인식 엔진: {engine_label}  (위 "AI / OCR 인식 설정"에서 변경)')
 
-  uploaded_file = st.file_uploader(
-      '스크린샷 업로드', type=['png', 'jpg', 'jpeg', 'webp']
+  uploaded_files = st.file_uploader(
+      '스크린샷 업로드 (여러 장 가능)',
+      type=['png', 'jpg', 'jpeg', 'webp'],
+      accept_multiple_files=True,
   )
-
-  image = None
-  if uploaded_file:
-    if uploaded_file.size > MAX_UPLOAD_MB * 1024 * 1024:
-      st.error(f'파일 크기는 {MAX_UPLOAD_MB}MB 이하여야 합니다.')
-    else:
-      try:
-        image = load_image(uploaded_file.getvalue())
-      except Exception:
-        st.error('이미지를 열 수 없습니다. 올바른 이미지 파일인지 확인해 주세요.')
+  files = list(uploaded_files or [])
+  if len(files) > MAX_BATCH_FILES:
+    st.warning(f'한 번에 최대 {MAX_BATCH_FILES}장까지 처리해요. 앞의 {MAX_BATCH_FILES}장만 사용합니다.')
+    files = files[:MAX_BATCH_FILES]
+  loaded = []  # [(파일명, 이미지)]
+  for f in files:
+    if f.size > MAX_UPLOAD_MB * 1024 * 1024:
+      st.error(f'{f.name}: 파일 크기는 {MAX_UPLOAD_MB}MB 이하여야 합니다.')
+      continue
+    try:
+      loaded.append((f.name, load_image(f.getvalue())))
+    except Exception:
+      st.error(f'{f.name}: 이미지를 열 수 없습니다. 올바른 이미지 파일인지 확인해 주세요.')
+  image = loaded[0][1] if loaded else None
 
   if image is not None:
     with st.expander('🎯 인식 영역 · 정확도 향상', expanded=True):
@@ -2342,13 +3503,13 @@ with main_tab1:
       contrast = oc1.checkbox('대비 자동 보정', value=False)
       sharpen = oc2.checkbox('선명하게 (샤프닝)', value=False)
 
-    region = (
-        crop_region(image, crop_x, crop_y)
-        if use_crop
-        else limit_size(image, MAX_FULL_SIDE)
-    )
-    target = enhance_image(region, UPSCALE_OPTIONS[scale_label], contrast, sharpen)
+    target = prepare_target(image, use_crop, crop_x, crop_y, scale_label, contrast, sharpen)
     caption = f'실제 인식 대상 · {target.width}×{target.height}px'
+    if len(loaded) > 1:
+      st.caption(
+          f'미리보기는 첫 번째 이미지({loaded[0][0]}) 기준이에요.'
+          f' 같은 영역·보정 설정이 {len(loaded)}장 모두에 적용됩니다.'
+      )
 
     if use_crop:
       col_a, col_b = st.columns([3, 2])
@@ -2359,111 +3520,175 @@ with main_tab1:
     else:
       show_image(target, caption)
 
-    if st.button('🤖 닉네임 자동 추출 시작'):
+    run_label = '🤖 닉네임 자동 추출 시작' + (f' ({len(loaded)}장)' if len(loaded) > 1 else '')
+    if st.button(run_label):
       label = custom_model if selected_model == CUSTOM_OPENROUTER else selected_model
-      with st.spinner(f'[{label}] 엔진으로 닉네임을 분석 중입니다...'):
+      new_batches, notices = [], []
+      progress = st.progress(0.0, text='분석 준비 중...')
+      for i, (name, img_i) in enumerate(loaded):
+        progress.progress(i / len(loaded), text=f'[{label}] {name} 분석 중... ({i + 1}/{len(loaded)})')
+        tgt = target if i == 0 else prepare_target(
+            img_i, use_crop, crop_x, crop_y, scale_label, contrast, sharpen
+        )
         try:
-          names, notice = run_extraction(
-              target, selected_model, custom_model, active_key
-          )
+          names, notice = run_extraction(tgt, selected_model, custom_model, active_key)
         except Exception as e:
-          st.error(friendly_error(e))
+          st.error(f'{name}: {friendly_error(e)}')
+          continue
+        if notice and notice not in notices:
+          notices.append(notice)
+        if names:
+          new_batches.append({'name': name, 'entries': names})
         else:
-          if notice:
-            st.info(notice)
-          if names:
-            st.session_state['extracted_nicknames'] = names
-            st.session_state.extract_ver += 1
-            st.success(f'닉네임 추출 완료! ({len(names)}명)')
-          else:
-            st.warning('인식된 닉네임이 없습니다.')
+          st.warning(f'{name}: 인식된 닉네임이 없습니다.')
+      progress.empty()
+      for n in notices:
+        st.info(n)
+      if new_batches:
+        st.session_state['extracted_batches'] = new_batches
+        st.session_state.extract_ver += 1
+        total = sum(len(b['entries']) for b in new_batches)
+        st.success(f'닉네임 추출 완료! ({len(new_batches)}장 · 총 {total}명)')
 
   # 추출된 닉네임 확인 및 등록
-  if st.session_state.get('extracted_nicknames'):
+  batches = st.session_state.get('extracted_batches')
+  if batches:
     st.divider()
     st.subheader('✨ 추출된 닉네임 확인 및 선택 등록')
     ver = st.session_state.extract_ver
     st.caption('글자가 틀렸을 수 있어요. 닉네임을 고친 뒤 🔍 버튼으로 전적 페이지를 열어 확인하세요.')
     plat = current_platform()
+    mobile = is_mobile()
 
-    picked = []
-    if is_mobile():
-      # 모바일: 한 명당 카드 1개 (체크 · "[클랜] 닉네임" 한 칸 · 전적 버튼)
-      for idx, entry in enumerate(st.session_state['extracted_nicknames']):
-        with bordered_container():
-          is_checked = st.checkbox(f'{idx + 1}번 저장', value=True, key=f'mchk_{ver}_{idx}')
-          raw = st.text_input(
-              f'{idx + 1}번 · [클랜] 닉네임',
-              value=entry_label(entry['clan'], entry['nickname']),
-              key=f'mtxt_{ver}_{idx}',
-              help='형식: [클랜] 닉네임 (클랜이 없으면 닉네임만)',
-          )
-          parsed = make_entry(raw)
+    picked_batches = []  # [(파일명, 선택된 항목)]
+    current_all = []     # 글자 혼동 확인용 [(batch idx, idx, 닉네임, 클랜)]
+    for b, batch in enumerate(batches):
+      picked = []
+      if len(batches) > 1:
+        st.markdown(f'#### 📷 {batch["name"]}')
+      if mobile:
+        # 모바일: 한 명당 카드 1개 (체크 · "[클랜] 닉네임" 한 칸 · 전적 버튼)
+        for idx, entry in enumerate(batch['entries']):
+          with bordered_container():
+            is_checked = st.checkbox(f'{idx + 1}번 저장', value=True, key=f'mchk_{ver}_{b}_{idx}')
+            raw = st.text_input(
+                f'{idx + 1}번 · [클랜] 닉네임',
+                value=entry_label(entry['clan'], entry['nickname']),
+                key=f'mtxt_{ver}_{b}_{idx}',
+                help='형식: [클랜] 닉네임 (클랜이 없으면 닉네임만)',
+            )
+            parsed = make_entry(raw)
+            if parsed['nickname']:
+              stats_button('🔍 전적 보기', stats_url(parsed['nickname'], plat))
+            else:
+              st.button('🔍 전적 보기', disabled=True, key=f'mnolink_{ver}_{b}_{idx}')
           if parsed['nickname']:
-            stats_button('🔍 전적 보기', stats_url(parsed['nickname'], plat))
-          else:
-            st.button('🔍 전적 보기', disabled=True, key=f'mnolink_{ver}_{idx}')
-        if is_checked and parsed['nickname']:
-          picked.append(parsed)
-    else:
-      head = st.columns([1, 2, 4, 2])
-      for col, text in zip(head, ['선택', '클랜', '닉네임 (수정 가능)', '전적 확인']):
-        col.caption(text)
-
-      for idx, entry in enumerate(st.session_state['extracted_nicknames']):
-        col1, col2, col3, col4 = st.columns([1, 2, 4, 2])
-        with col1:
-          is_checked = st.checkbox('선택', value=True, key=f'chk_{ver}_{idx}')
-        with col2:
-          clan_edit = st.text_input(
-              f'클랜 {idx + 1}',
-              value=entry['clan'],
-              key=f'clan_{ver}_{idx}',
-              placeholder='(없음)',
-              label_visibility='collapsed',
-          )
-        with col3:
-          nick_edit = st.text_input(
-              f'닉네임 {idx + 1}',
-              value=entry['nickname'],
-              key=f'txt_{ver}_{idx}',
-              label_visibility='collapsed',
-          ).strip()
-        with col4:
+            current_all.append((b, idx, parsed['nickname'], parsed['clan']))
+          if is_checked and parsed['nickname']:
+            picked.append(parsed)
+      else:
+        head = st.columns([1, 2, 4, 2])
+        for col, text in zip(head, ['선택', '클랜', '닉네임 (수정 가능)', '전적 확인']):
+          col.caption(text)
+        for idx, entry in enumerate(batch['entries']):
+          col1, col2, col3, col4 = st.columns([1, 2, 4, 2])
+          with col1:
+            is_checked = st.checkbox('선택', value=True, key=f'chk_{ver}_{b}_{idx}')
+          with col2:
+            clan_edit = st.text_input(
+                f'클랜 {idx + 1}',
+                value=entry['clan'],
+                key=f'clan_{ver}_{b}_{idx}',
+                placeholder='(없음)',
+                label_visibility='collapsed',
+            )
+          with col3:
+            nick_edit = st.text_input(
+                f'닉네임 {idx + 1}',
+                value=entry['nickname'],
+                key=f'txt_{ver}_{b}_{idx}',
+                label_visibility='collapsed',
+            ).strip()
+          with col4:
+            if nick_edit:
+              stats_button('🔍 전적 보기', stats_url(nick_edit, plat))
+            else:
+              st.button('🔍 전적 보기', disabled=True, key=f'nolink_{ver}_{b}_{idx}')
           if nick_edit:
-            stats_button('🔍 전적 보기', stats_url(nick_edit, plat))
-          else:
-            st.button('🔍 전적 보기', disabled=True, key=f'nolink_{ver}_{idx}')
-        if is_checked and nick_edit:
-          picked.append({'clan': clan_edit.strip(' []()'), 'nickname': nick_edit})
+            current_all.append((b, idx, nick_edit, clan_edit.strip(' []()')))
+          if is_checked and nick_edit:
+            picked.append({'clan': clan_edit.strip(' []()'), 'nickname': nick_edit})
+      picked_batches.append((batch['name'], picked))
+
+    # 글자 혼동 도우미: DB에 철자만 다른 닉네임이 있으면 알려주고, 후보 링크를 보여준다
+    hints = [
+        (b, idx, nick, find_similar_in_db(nick), confusable_variants(nick))
+        for b, idx, nick, _clan in current_all
+    ]
+    if any(sim for *_x, sim, _v in hints):
+      st.warning('🔤 DB에 철자만 다른 닉네임이 있어요. 같은 사람이라면 아래 버튼으로 바꿔 주세요.')
+      for b, idx, nick, sim, _v in hints:
+        for j, (sim_nick, sim_clan) in enumerate(sim):
+          st.button(
+              f'`{nick}` → `{sim_nick}`(으)로 바꾸기',
+              key=f'sim_{ver}_{b}_{idx}_{j}',
+              on_click=apply_nick_choice,
+              args=(f'txt_{ver}_{b}_{idx}', f'clan_{ver}_{b}_{idx}',
+                    f'mtxt_{ver}_{b}_{idx}', mobile, sim_nick, sim_clan),
+          )
+    with_variants = [(nick, v) for _b, _i, nick, _s, v in hints if v]
+    if with_variants:
+      with st.expander('🔤 헷갈리는 글자 확인 (l/I/1, O/0, S/5 …)'):
+        st.caption('비슷한 글자를 바꾼 후보예요. 눌러서 전적 페이지가 열리면 그 철자가 맞는 거예요.')
+        for nick, variants in with_variants:
+          st.markdown(
+              f'**{md_escape(nick)}** → '
+              + ' · '.join(f'[{md_escape(v)}]({stats_url(v, plat)})' for v in variants[:10])
+          )
 
     manual_add = st.text_input(
         '직접 추가 (쉼표로 구분, "[클랜] 닉네임" 형식 가능 · 전체 합계'
-        f' 최대 {MAX_SQUAD}명)'
+        f' 최대 {MAX_SQUAD}명)',
+        key=f'manual_add_{ver}',
     )
 
     if st.button('선택한 닉네임 DB에 저장하기', type='primary'):
-      extra = [make_entry(n) for n in manual_add.split(',') if n.strip()]
-      final = dedupe_entries(picked + extra)
-      if not final:
+      plans, error = [], ''
+      for name, picked in picked_batches:
+        final = dedupe_entries(picked)
+        if not final:
+          continue
+        err = validate_entries(final)
+        if err:
+          error = f'{name}: {err}'
+          break
+        plans.append((name, final))
+      if not error:
+        extra = dedupe_entries([make_entry(n) for n in manual_add.split(',') if n.strip()])
+        if extra:
+          err = validate_entries(extra)
+          if err:
+            error = f'직접 추가: {err}'
+          else:
+            plans.append(('직접 입력', extra))
+      if error:
+        st.error(error)
+      elif not plans:
         st.warning('저장할 닉네임이 선택되지 않았습니다.')
-      elif len(final) > MAX_SQUAD:
-        st.error(f'한 번에 최대 {MAX_SQUAD}명까지만 저장할 수 있습니다.')
-      elif any(len(e['nickname']) > MAX_NICK_LEN for e in final):
-        st.error(f'닉네임은 {MAX_NICK_LEN}자 이하여야 합니다.')
-      elif any(len(e['clan']) > MAX_CLAN_LEN for e in final):
-        st.error(f'클랜 태그는 {MAX_CLAN_LEN}자 이하여야 합니다.')
       else:
-        added, updated, skipped = save_nicknames(
-            username, final, uploaded_file.name if uploaded_file else '직접 입력'
-        )
+        added = updated = skipped = 0
+        for source, final in plans:
+          a, u, sk = save_nicknames(username, final, source)
+          added, updated, skipped = added + a, updated + u, skipped + sk
         parts = [f'{added}개 저장']
         if updated:
           parts.append(f'클랜 정보 {updated}개 갱신')
         if skipped:
           parts.append(f'이미 등록된 {skipped}개 건너뜀')
+        if len(plans) > 1:
+          parts.append(f'{len(plans)}판 기록')
         flash('✅ ' + ', '.join(parts))
-        del st.session_state['extracted_nicknames']
+        del st.session_state['extracted_batches']
         st.rerun()
 
   st.divider()
@@ -2501,14 +3726,14 @@ with main_tab_search:
     if cand.empty:
       st.info('검색 결과가 없습니다. 철자를 바꿔서 다시 찾아보세요.')
     else:
-      nick_link_table(search_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자'])
+      nick_link_table(search_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
   else:
     cand = load_recent_nicknames(30)
     st.subheader('🕒 최근 추가된 닉네임')
     if cand.empty:
       st.info('아직 등록된 닉네임이 없습니다.')
     else:
-      nick_link_table(recent_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자'])
+      nick_link_table(recent_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
 
   # ---- 전적 확인 (오타 수정 후 검색) ----
   st.divider()
@@ -2554,6 +3779,132 @@ with main_tab_search:
       else:
         st.caption('다른 회원이 등록한 닉네임은 관리자만 수정할 수 있어요.')
 
+  nickname_tools(v_nick, 'search')
+
+# ------------------------------------------
+# [탭] 함께한 사람 (스쿼드 기록)
+# ------------------------------------------
+with main_tab_squad:
+  st.header('🤝 함께한 사람')
+  st.caption(
+      '스크린샷을 저장할 때 한 번에 저장한 스쿼드(2명 이상)를 한 판으로 기록해요.'
+      ' 내가 저장한 기록 기준이에요.'
+  )
+  my_nick = get_my_nickname(username)
+  with st.expander('👤 내 닉네임 설정 (목록에서 제외돼요)', expanded=not my_nick):
+    my_nick_in = st.text_input('내 닉네임', value=my_nick, key='my_nick_input')
+    if st.button('저장', key='my_nick_save'):
+      set_my_nickname(username, my_nick_in)
+      flash('내 닉네임을 저장했어요.')
+      st.rerun()
+
+  partners = top_partners(username, exclude=my_nick)
+  if partners.empty:
+    st.info('아직 기록이 없어요. 수집 탭에서 스쿼드 스크린샷을 저장하면 여기에 쌓여요.')
+  else:
+    st.subheader('자주 같이 한 사람')
+    nick_link_table(
+        pd.DataFrame({
+            '닉네임': partners['nickname'],
+            '클랜': partners['clan'],
+            '함께한 판': partners['games'].map(lambda g: f'{g}판'),
+            '마지막': partners['last_at'].map(time_ago),
+        }),
+        nick_col='닉네임',
+        mobile_cols=['함께한 판', '마지막'],
+    )
+
+    st.divider()
+    st.subheader('👤 이 사람과의 기록')
+    who = st.selectbox('닉네임 선택', list(partners['nickname']), key='squad_who')
+    st.write(f'**{who}** 님과 함께한 판: **{games_with(username, who)}판**')
+    with_who = partners_of(username, who)
+    if not with_who.empty:
+      st.caption('이 사람과 같은 판에 있던 다른 사람들')
+      nick_link_table(
+          pd.DataFrame({
+              '닉네임': with_who['nickname'],
+              '클랜': with_who['clan'],
+              '함께한 판': with_who['games'].map(lambda g: f'{g}판'),
+              '마지막': with_who['last_at'].map(time_ago),
+          }),
+          nick_col='닉네임',
+          mobile_cols=['함께한 판', '마지막'],
+      )
+    st.markdown('**최근 함께한 판**')
+    st.markdown(squad_markdown(recent_squads(username, who, 10), current_platform()))
+
+  squads_now = recent_squads(username, limit=10)
+  if squads_now:
+    st.divider()
+    st.subheader('🕒 최근 스쿼드')
+    st.markdown(squad_markdown(squads_now, current_platform()))
+
+# ------------------------------------------
+# [탭] 즐겨찾기 · 메모 (개인)
+# ------------------------------------------
+with main_tab_notes:
+  st.header('⭐ 즐겨찾기 · 메모')
+  st.caption('나만 볼 수 있는 개인 메모예요. 닉네임을 누르면 전적 페이지가 열려요.')
+  notes_df = load_notes(username)
+
+  def _notes_view(df):
+    return pd.DataFrame({
+        '닉네임': df['nickname'],
+        '태그': df['tags'].str.replace(',', ' · '),
+        '메모': df['note'].str.slice(0, 40),
+    })
+
+  st.subheader('⭐ 즐겨찾기 전적 바로가기')
+  fav_df = notes_df[notes_df['favorite'] == 1]
+  if fav_df.empty:
+    st.caption('즐겨찾기가 없어요. 아래에서 닉네임을 즐겨찾기로 추가해 보세요.')
+  else:
+    nick_link_table(_notes_view(fav_df), nick_col='닉네임', mobile_cols=['태그', '메모'])
+  other_df = notes_df[notes_df['favorite'] != 1]
+  if not other_df.empty:
+    with st.expander(f'📝 메모만 있는 닉네임 ({len(other_df)})'):
+      nick_link_table(_notes_view(other_df), nick_col='닉네임', mobile_cols=['태그', '메모'])
+
+  st.divider()
+  st.subheader('📝 메모 추가 · 수정')
+  with db() as conn:
+    my_names = [
+        r[0] for r in conn.execute(
+            'SELECT DISTINCT nickname FROM nicknames WHERE username = ?', (username,)
+        )
+    ]
+  known = sorted(set(my_names) | set(notes_df['nickname']), key=str.lower)
+  DIRECT_N = '✍️ 직접 입력'
+  pick_n = st.selectbox('닉네임 선택', [DIRECT_N] + known, key='note_pick')
+  nick_in = st.text_input(
+      '닉네임', value='' if pick_n == DIRECT_N else pick_n, key=f'note_nick_{pick_n}'
+  ).strip()
+  existing = get_note(username, nick_in) if nick_in else None
+  kk = nick_key(nick_in)
+  cur_tags = existing['tags'] if existing else []
+  tag_options = PRESET_TAGS + [t for t in cur_tags if t not in PRESET_TAGS]
+  fav_in = st.checkbox('⭐ 즐겨찾기', value=bool(existing and existing['favorite']), key=f'note_fav_{kk}')
+  tags_in = st.multiselect(
+      '태그', tag_options, default=[t for t in cur_tags if t in tag_options], key=f'note_tags_{kk}'
+  )
+  extra_in = st.text_input('직접 태그 (쉼표로 구분)', key=f'note_extra_{kk}')
+  note_in = st.text_area(
+      '메모', value=existing['note'] if existing else '', max_chars=MAX_NOTE_LEN, key=f'note_text_{kk}'
+  )
+  nb1, nb2 = st.columns(2)
+  if nb1.button('💾 저장', key='note_save', type='primary'):
+    ok, msg = save_note(username, nick_in, fav_in, parse_tags(tags_in, extra_in), note_in)
+    flash(msg, 'success' if ok else 'error')
+    st.rerun()
+  if existing and nb2.button('🗑️ 메모 삭제', key='note_delete'):
+    delete_note(username, nick_in)
+    flash('메모를 삭제했어요.')
+    st.rerun()
+  if nick_in:
+    stats_button('🔍 전적 보기', stats_url(nick_in, current_platform()))
+    nickname_tools(nick_in, 'notes')
+
 # ------------------------------------------
 # [탭 2] 내 닉네임 목록
 # ------------------------------------------
@@ -2598,6 +3949,7 @@ with main_tab2:
             'DELETE FROM nicknames WHERE id = ? AND username = ?',
             [(i, username) for i in del_ids],
         )
+      cleanup_squads()
       flash(f'{len(del_ids)}개의 닉네임이 삭제되었습니다.')
       st.rerun()
 
@@ -2650,6 +4002,17 @@ if st.session_state.is_admin:
       with right2:
         st.subheader('최근 수집 10건')
         nick_link_table(stats['recent'], nick_col='닉네임')
+
+      st.divider()
+      st.subheader('🕒 시간대별 · 요일별 등록')
+      _hdf, _ddf = load_time_stats()
+      tcol1, tcol2 = st.columns(2)
+      with tcol1:
+        st.caption('시간대별 (한국 시간 기준)')
+        st.bar_chart(_hdf)
+      with tcol2:
+        st.caption('요일별')
+        st.bar_chart(_ddf)
 
     # ---------- 닉네임 관리 ----------
     with a_nick:
@@ -2762,6 +4125,7 @@ if st.session_state.is_admin:
           '권한': df_users['role'].map(ROLE_LABELS),
           '이메일': df_users['email'],
           '이메일 인증': df_users['email_verified'].map({1: '✅ 완료'}).fillna(''),
+          '2단계 인증': df_users['twofa'].map({1: '✅'}).fillna(''),
           '가입일': df_users['created_at'],
           '수집 닉네임': df_users['nick_count'],
           '마지막 수집': df_users['last_collected'],
@@ -2822,7 +4186,7 @@ if st.session_state.is_admin:
       elif ROLE_RANK[t_role] >= ROLE_RANK[my_role]:
         st.info('같거나 높은 권한의 계정은 관리할 수 없습니다.')
       else:
-        actions = ['비밀번호 초기화', 'API 키 삭제', '계정 삭제']
+        actions = ['비밀번호 초기화', '2단계 인증 해제', 'API 키 삭제', '계정 삭제']
         if my_role == ROLE_SUPER:
           actions.insert(0, '권한 변경')
         action = st.radio('작업', actions, horizontal=True, key=f'user_action_{target}')
@@ -2845,6 +4209,13 @@ if st.session_state.is_admin:
           st.caption('임시 비밀번호를 발급합니다. 회원에게 전달하고, 로그인 후 바로 변경하도록 안내하세요.')
           if st.button('임시 비밀번호 발급', key=f'reset_{target}'):
             ok, msg = admin_reset_password(target)
+            flash(msg, 'success' if ok else 'error')
+            st.rerun()
+
+        elif action == '2단계 인증 해제':
+          st.caption('이메일을 잃어버려 로그인할 수 없는 회원을 위해 2단계 인증을 해제합니다.')
+          if st.button('2단계 인증 해제', key=f'twofa_off_{target}'):
+            ok, msg = admin_disable_twofa(target)
             flash(msg, 'success' if ok else 'error')
             st.rerun()
 
@@ -2974,6 +4345,89 @@ if st.session_state.is_admin:
               '- 서비스마다 정책이 다를 수 있으니 각 메일 서비스의 SMTP 안내를 확인하세요.'
           )
 
+        st.divider()
+        st.subheader('☁️ 자동 클라우드 동기화')
+        _sync_problem = sync_problem()
+        _sync_cfg = sync_config()
+        _st = sync_state()
+        if _sync_problem == '설정되지 않음':
+          st.info(
+              '아직 설정되지 않았어요. 설정하면 데이터가 바뀔 때마다 **암호화된 스냅샷**이 GitHub 비공개 저장소에 '
+              '자동 저장되고, 앱이 재시작돼 데이터가 사라져도 **시작할 때 자동으로 복원**돼요.'
+          )
+        elif _sync_problem:
+          st.error(_sync_problem)
+        else:
+          st.success('✅ 자동 동기화가 켜져 있어요.')
+          st.caption(
+              f"저장소 `{_sync_cfg['repo']}` · 경로 `{_sync_cfg['path']}` · "
+              f"마지막 업로드 {_st['last_ok'] or '-'} · 업로드 {_st['pushes']}회 · "
+              f"시작 시: {_st['restored'] or '확인 전'}"
+          )
+          if _st['last_error']:
+            st.error(f"최근 오류: {_st['last_error']}")
+          sy1, sy2 = st.columns(2)
+          if sy1.button('🔌 연결 테스트', key='sync_test_btn'):
+            _ok, _msg = sync_test()
+            (st.success if _ok else st.error)(_msg)
+          if sy2.button('⬆️ 지금 업로드', key='sync_push_btn'):
+            _ok, _msg = sync_push_now()
+            (st.success if _ok else st.error)(_msg)
+          with st.expander('⬇️ 원격 스냅샷으로 복원 (현재 데이터를 덮어씀)'):
+            with st.form('sync_pull_form'):
+              _agree = st.checkbox('현재 데이터가 모두 원격 스냅샷으로 교체되는 것에 동의합니다.')
+              if st.form_submit_button('복원하기'):
+                if not _agree:
+                  st.warning('동의에 체크해 주세요.')
+                else:
+                  _ok, _msg = sync_pull_restore()
+                  if _ok:
+                    log_admin('원격 스냅샷 복원', '', _msg)
+                    flash('✅ ' + _msg)
+                    st.rerun()
+                  else:
+                    st.error(_msg)
+        with st.expander('설정 방법 (처음 한 번)'):
+          st.markdown(
+              '1. GitHub에서 **Private** 저장소를 새로 만드세요 (예: `pubg-data`). **"Add a README file"를 체크**해 빈 저장소가 되지 않게 하세요.\n'
+              '2. GitHub `Settings → Developer settings → Personal access tokens → Fine-grained tokens`에서 새 토큰을 만들고, '
+              '**위 저장소만 선택**한 뒤 권한 `Contents: Read and write`를 주세요.\n'
+              '3. Streamlit `Settings → Secrets`에 아래를 추가하고 앱을 재시작하세요.\n'
+          )
+          st.code(
+              'GITHUB_SYNC_TOKEN = "github_pat_..."\n'
+              'GITHUB_SYNC_REPO = "내GitHub아이디/pubg-data"\n'
+              'APP_SECRET_KEY = "아무도-모르는-긴-문자열"   # 필수: 스냅샷 암호화 키\n'
+              '# 선택: GITHUB_SYNC_BRANCH = "main",  GITHUB_SYNC_PATH = "pubg_manager.db.enc"',
+              language='toml',
+          )
+          st.caption(
+              '⚠️ APP_SECRET_KEY를 잃어버리면 스냅샷을 복호화할 수 없어요. 앱을 **동시에 여러 곳(로컬+호스팅)에서 같은 저장소로 '
+              '동기화하지 마세요** (서로 덮어써요). 변경 후 약 1분 안에 업로드되며, 그 사이 재시작되면 마지막 1분 변경은 잃을 수 있어요.'
+          )
+        st.divider()
+        st.subheader('📊 PUBG 공식 API (전적 요약)')
+        st.caption(
+            '키를 등록하면 검색·즐겨찾기 화면에서 앱 안에 전적 요약을 보여줘요.'
+            ' Secrets에 `PUBG_API_KEY`로 넣어도 됩니다. 키 발급: https://developer.pubg.com'
+        )
+        if get_secret('PUBG_API_KEY'):
+          st.success('Secrets의 `PUBG_API_KEY`를 사용 중입니다.')
+        with st.form('pubg_api_form'):
+          pubg_key_in = st.text_input(
+              'PUBG API 키', type='password',
+              placeholder='저장되어 있음 (바꿀 때만 입력)' if get_setting('pubg_api_key', '') else '',
+          )
+          if st.form_submit_button('💾 키 저장') and pubg_key_in.strip():
+            set_setting('pubg_api_key', encrypt_secret(pubg_key_in.strip()))
+            log_admin('PUBG API 키 저장')
+            flash('PUBG API 키를 저장했습니다.')
+            st.rerun()
+        if get_setting('pubg_api_key', '') and st.button('저장된 PUBG API 키 삭제'):
+          set_setting('pubg_api_key', '')
+          log_admin('PUBG API 키 삭제')
+          flash('PUBG API 키를 삭제했습니다.')
+          st.rerun()
         st.divider()
         st.subheader('데이터베이스')
         size_kb = os.path.getsize(DB_FILE) / 1024 if os.path.exists(DB_FILE) else 0
