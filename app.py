@@ -70,6 +70,8 @@ st.set_page_config(
 # 0. 설정 상수
 # ==========================================
 DB_FILE = os.environ.get('PUBG_DB_FILE', 'pubg_manager.db')
+if not os.access(os.path.dirname(os.path.abspath(DB_FILE)) or '.', os.W_OK):
+  DB_FILE = os.path.join(tempfile.gettempdir(), 'pubg_manager.db')  # 쓰기 불가 폴더 대비
 KEY_FILE = '.app_secret.key'
 PBKDF2_ITERATIONS = 200_000
 MAX_SQUAD = 4
@@ -338,7 +340,7 @@ def snapshot_db_bytes():
   """SQLite 백업 API로 일관된 DB 스냅샷(bytes)을 만든다 (권한 검사 없음)."""
   with tempfile.TemporaryDirectory() as tmp:
     path = os.path.join(tmp, 'snapshot.db')
-    src = sqlite3.connect(DB_FILE)
+    src = sqlite3.connect(DB_FILE, timeout=15)
     dst = sqlite3.connect(path)
     try:
       src.backup(dst)
@@ -580,7 +582,10 @@ def sync_bootstrap():
 
 def init_db():
   with db() as conn:
-    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+      conn.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.OperationalError:
+      pass  # WAL을 못 쓰는 환경/일시 잠금이어도 기본 모드로 계속 진행
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -771,9 +776,22 @@ def get_setup_code():
   return code
 
 
-init_db()
-if not super_exists():
-  get_setup_code()  # 설정 코드 파일 생성 + 콘솔 출력
+@st.cache_resource(show_spinner=False)
+def init_db_once():
+  """DB 준비(테이블/마이그레이션)는 프로세스당 한 번만 — 여러 접속이 동시에 만지지 않도록."""
+  init_db()
+  return True
+
+
+try:
+  init_db_once()
+  if not super_exists():
+    get_setup_code()  # 설정 코드 파일 생성 + 콘솔 출력
+except sqlite3.OperationalError as _db_err:
+  st.error(f'DB를 여는 중 오류가 발생했습니다: {_db_err}')
+  st.caption('잠시 뒤 새로고침하거나, 앱 관리에서 Reboot app을 눌러 보세요. 계속되면 위 메시지를 알려 주세요.')
+  st.code(f'DB 경로: {os.path.abspath(DB_FILE)}')
+  st.stop()
 
 
 # 세션 상태 초기화
@@ -2990,7 +3008,7 @@ def restore_database(data):
     with open(path, 'wb') as f:
       f.write(data)
     src = sqlite3.connect(path)
-    dst = sqlite3.connect(DB_FILE)
+    dst = sqlite3.connect(DB_FILE, timeout=15)
     try:
       src.backup(dst)
     finally:
