@@ -916,7 +916,7 @@ def _token_hash(token):
 
 def cookies_supported():
   try:
-    st.context.cookies  # Streamlit 1.37+
+    _ = st.context.cookies  # Streamlit 1.37+ (변수에 담아야 값이 화면에 자동 출력되지 않음)
     return True
   except Exception:
     return False
