@@ -2,7 +2,8 @@
 
 import base64
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
+import ipaddress
 from email.message import EmailMessage
 import hashlib
 import hmac
@@ -112,6 +113,12 @@ REMEMBER_IDLE_DAYS = 14  # 이 기간 동안 접속이 없으면 만료 (접속�
 REMEMBER_MAX_DAYS = 30  # 연장해도 최초 로그인 후 이 기간이 지나면 다시 로그인
 REMEMBER_GRACE_SECONDS = 120  # 토큰 교체 직후 이전 토큰의 유예 시간
 REMEMBER_MAX_DEVICES = 10
+
+# 접속 기록 (다중 계정 확인용)
+DEVICE_COOKIE = 'pubg_did'  # 기기 식별용 무작위 값 (개인정보 아님, 지우면 새로 생성)
+DEVICE_COOKIE_DAYS = 365
+ACCESS_LOG_DAYS = 90  # 접속 기록 보관 기간 (지나면 자동 삭제)
+ACCESS_OK_EVENTS = ('로그인', '자동 로그인', '회원가입')
 
 FREE_OCR = '무료 기본 OCR (EasyOCR)'
 CUSTOM_OPENROUTER = 'openrouter:custom'
@@ -225,6 +232,11 @@ def get_secret(name, default=''):
     return value
   try:
     value = st.secrets.get(name)
+    if not value:  # [섹션] 아래에 적은 경우도 찾아준다 (TOML에서 흔한 실수)
+      for _k, sect in st.secrets.items():
+        if hasattr(sect, 'get') and not isinstance(sect, str) and sect.get(name):
+          value = sect.get(name)
+          break
   except Exception:  # secrets 파일/설정이 없는 환경
     return default
   return str(value) if value else default
@@ -690,6 +702,24 @@ def init_db():
     conn.execute(
         'CREATE INDEX IF NOT EXISTS idx_token_user ON login_tokens(username)'
     )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            event TEXT NOT NULL,
+            ip TEXT DEFAULT '',
+            device_id TEXT DEFAULT '',
+            device TEXT DEFAULT '',
+            os TEXT DEFAULT '',
+            browser TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_access_user ON access_log(username)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_access_dev ON access_log(device_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_access_ip ON access_log(ip)')
     if 'twofa' not in ucols:
       conn.execute('ALTER TABLE users ADD COLUMN twofa INTEGER DEFAULT 0')
     if 'login_alert' not in ucols:
@@ -734,6 +764,11 @@ def init_db():
     """)
     if 'my_nickname' not in ucols:
       conn.execute("ALTER TABLE users ADD COLUMN my_nickname TEXT DEFAULT ''")
+    if 'privacy_agreed_at' not in ucols:
+      conn.execute("ALTER TABLE users ADD COLUMN privacy_agreed_at TEXT DEFAULT ''")
+    # 닉네임별 플랫폼(steam/kakao) — 예전 데이터는 비어 있음(미지정)
+    if 'platform' not in {r[1] for r in conn.execute('PRAGMA table_info(nicknames)')}:
+      conn.execute("ALTER TABLE nicknames ADD COLUMN platform TEXT DEFAULT ''")
     # 구버전 데이터: 같은 시각·같은 출처로 저장된 닉네임을 한 판으로 간주 (최초 1회)
     if conn.execute('SELECT COUNT(*) FROM squad_members').fetchone()[0] == 0:
         groups = {}
@@ -862,6 +897,7 @@ def open_session(username, remember=False, must_change_pw=False):
   )
   if remember and cookies_supported():
     issue_login_token(username)
+  log_access(username, '로그인')
 
 
 def login_user(username, password, remember=False):
@@ -900,6 +936,8 @@ def login_user(username, password, remember=False):
     return True, ''
 
   note_auth_failure()
+  if row:  # 존재하는 계정에 대한 실패만 기록
+    log_access(username, '로그인 실패')
   return False, '아이디 또는 비밀번호가 올바르지 않습니다.'
 
 
@@ -1032,7 +1070,220 @@ def login_with_cookie():
       login_fails=0, must_change_pw=False,
   )
   issue_login_token(row[0], issued_at=row[1])
+  log_access(row[0], '자동 로그인')
   return True
+
+
+# ---------- 접속 기록 (다중 계정 확인용) ----------
+def _header(name):
+  try:
+    return (st.context.headers.get(name, '') or '').strip()
+  except Exception:
+    return ''
+
+
+def _valid_ip(text):
+  try:
+    return ipaddress.ip_address(text.strip())
+  except ValueError:
+    return None
+
+
+def client_ip():
+  """접속 IP (프록시 뒤라면 X-Forwarded-For 우선). 알 수 없으면 ''.
+
+  ※ 헤더는 조작될 수 있고 호스팅 환경에 따라 비어 있을 수 있어 참고용이다.
+  """
+  cands = []
+  fwd = _header('X-Forwarded-For')
+  if fwd:
+    cands += [c.strip() for c in fwd.split(',')]
+  cands.append(_header('X-Real-Ip'))
+  try:
+    cands.append(st.context.ip_address or '')
+  except Exception:
+    pass
+  parsed = [(c, _valid_ip(c)) for c in cands if c]
+  for c, ip in parsed:  # 공인 IP 우선
+    if ip is not None and ip.is_global:
+      return c[:45]
+  for c, ip in parsed:
+    if ip is not None:
+      return c[:45]
+  return ''
+
+
+def parse_user_agent(ua):
+  """User-Agent → (기기 종류, 운영체제, 브라우저). 간단한 규칙 기반."""
+  ua = ua or ''
+  if not ua:
+    return '알 수 없음', '알 수 없음', '알 수 없음'
+  # 기기 종류 + 모델
+  if 'iPad' in ua or ('Android' in ua and 'Mobile' not in ua) or 'Tablet' in ua:
+    device = '태블릿'
+  elif re.search(r'Mobi|iPhone|iPod|Android', ua):
+    device = '모바일'
+  else:
+    device = 'PC'
+  model = ''
+  m = re.search(r'Android [\d.]+; (?:[a-z]{2}[-_][A-Za-z]{2}; )?([^;)]+?)(?: Build/[^;)]*)?\)', ua)
+  if m and m.group(1).strip() not in ('K', 'wv'):
+    model = m.group(1).strip()
+  elif 'iPhone' in ua:
+    model = 'iPhone'
+  elif 'iPad' in ua:
+    model = 'iPad'
+  if model:
+    device = f'{device} ({model[:30]})'
+  # 운영체제
+  os_name = '기타'
+  m = re.search(r'(?:iPhone|CPU) OS (\d+)[_.](\d+)', ua)
+  if m:
+    os_name = f'iOS {m.group(1)}.{m.group(2)}'
+  elif (m := re.search(r'Android (\d+(?:\.\d+)?)', ua)):
+    os_name = f'Android {m.group(1)}'
+  elif 'Windows NT 10.0' in ua:
+    hint = _header('Sec-CH-UA-Platform-Version').strip('"')
+    major = int(hint.split('.')[0]) if hint.split('.')[0].isdigit() else 0
+    os_name = 'Windows 11' if major >= 13 else 'Windows 10/11'
+  elif (m := re.search(r'Windows NT ([\d.]+)', ua)):
+    os_name = {'6.3': 'Windows 8.1', '6.2': 'Windows 8', '6.1': 'Windows 7'}.get(m.group(1), 'Windows')
+  elif 'Mac OS X' in ua or 'Macintosh' in ua:
+    os_name = 'macOS'
+  elif 'CrOS' in ua:
+    os_name = 'ChromeOS'
+  elif 'Linux' in ua:
+    os_name = 'Linux'
+  # 브라우저 (앱 내장 브라우저 먼저)
+  rules = [
+      (r'KAKAOTALK', '카카오톡 인앱'), (r'NAVER\(inapp', '네이버앱 인앱'),
+      (r'Instagram', '인스타그램 인앱'), (r'FBAN|FBAV', '페이스북 인앱'),
+      (r'DaumApps', '다음앱 인앱'), (r'Whale/([\d]+)', '웨일'),
+      (r'SamsungBrowser/([\d]+)', '삼성 인터넷'), (r'Edg(?:e|A|iOS)?/([\d]+)', 'Edge'),
+      (r'OPR/([\d]+)|Opera', 'Opera'), (r'(?:Firefox|FxiOS)/([\d]+)', 'Firefox'),
+      (r'(?:Chrome|CriOS)/([\d]+)', 'Chrome'), (r'Version/([\d]+).*Safari', 'Safari'),
+  ]
+  browser = '기타'
+  for pat, name in rules:
+    m = re.search(pat, ua)
+    if m:
+      ver = next((g for g in m.groups() if g), '') if m.groups() else ''
+      browser = f'{name} {ver}'.strip()
+      break
+  return device, os_name, browser
+
+
+def device_id():
+  """이 브라우저를 구분하는 무작위 값 (쿠키에 1년 보관). 세션마다 1번만 계산."""
+  did = st.session_state.get('device_id')
+  if did:
+    return did
+  try:
+    did = (st.context.cookies.get(DEVICE_COOKIE, '') or '').strip()
+  except Exception:
+    did = ''
+  if not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', did):
+    did = secrets.token_urlsafe(16)
+    st.session_state['device_cookie_pending'] = did
+  st.session_state['device_id'] = did
+  return did
+
+
+def flush_device_cookie():
+  did = st.session_state.pop('device_cookie_pending', None)
+  if not did or components is None:
+    return
+  components.html(
+      f"""<script>
+      (function () {{
+        try {{
+          var p = window.parent;
+          var secure = p.location.protocol === 'https:' ? '; Secure' : '';
+          p.document.cookie = '{DEVICE_COOKIE}=' + encodeURIComponent({json.dumps(did)}) +
+              '; max-age={DEVICE_COOKIE_DAYS * 86400}; path=/; SameSite=Lax' + secure;
+        }} catch (e) {{}}
+      }})();
+      </script>""",
+      height=0,
+  )
+
+
+def log_access(username, event):
+  """접속 기록 1건 저장 (+ 보관 기간 지난 기록 자동 삭제). 실패해도 앱은 계속."""
+  try:
+    ua = _header('User-Agent')[:400]
+    dev, os_name, browser = parse_user_agent(ua)
+    did = device_id() if cookies_supported() else ''
+    ip = client_ip()
+    now = datetime.now()
+    with db() as conn:
+      notes = []
+      if event in ACCESS_OK_EVENTS and did:
+        others = [r[0] for r in conn.execute(
+            'SELECT DISTINCT username FROM access_log WHERE device_id = ? AND username != ?'
+            f" AND event IN ({','.join('?' * len(ACCESS_OK_EVENTS))})",
+            (did, username, *ACCESS_OK_EVENTS),
+        ).fetchall()]
+        if others:
+          notes.append('⚠️ 같은 기기 사용 계정: ' + ', '.join(others[:5]))
+        seen = conn.execute(
+            'SELECT 1 FROM access_log WHERE username = ? AND device_id = ? LIMIT 1',
+            (username, did),
+        ).fetchone()
+        had_any = conn.execute(
+            'SELECT 1 FROM access_log WHERE username = ? LIMIT 1', (username,)
+        ).fetchone()
+        if had_any and not seen:
+          notes.append('🆕 새 기기')
+      conn.execute(
+          'INSERT INTO access_log (username, event, ip, device_id, device, os, browser,'
+          ' user_agent, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          (username, event, ip, did, dev, os_name, browser, ua, ' · '.join(notes),
+           now.strftime('%Y-%m-%d %H:%M:%S')),
+      )
+      cutoff = (now - timedelta(days=ACCESS_LOG_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+      conn.execute('DELETE FROM access_log WHERE created_at < ?', (cutoff,))
+  except Exception as e:
+    print(f'[접속 기록 실패] {type(e).__name__}: {e}', flush=True)
+
+
+def mark_privacy_agreed(username):
+  with db() as conn:
+    conn.execute(
+        'UPDATE users SET privacy_agreed_at = ? WHERE username = ?', (now_str(), username)
+    )
+
+
+def privacy_agreed(username):
+  with db() as conn:
+    row = conn.execute(
+        'SELECT privacy_agreed_at FROM users WHERE username = ?', (username,)
+    ).fetchone()
+  return bool(row and row[0])
+
+
+PRIVACY_NOTICE = f"""
+**🔒 개인정보 수집·이용 안내**
+
+- **수집 항목**: 아이디, 비밀번호(복원 불가능하게 암호화), 이메일(입력·인증한 경우),
+  **접속 기록** — 접속 일시, IP 주소, 기기 종류·운영체제·브라우저 정보(User-Agent),
+  기기 구분용 쿠키(무작위로 만든 값, 이름·전화번호 같은 정보는 들어 있지 않음)
+- **수집 목적**: 한 사람이 여러 계정을 만드는 **다중 계정·부정 이용 확인**, 계정 도용 방지 등 보안
+- **열람 권한**: 관리자만 열람할 수 있어요. IP 전체 주소는 최종관리자만 보고, 일반관리자에게는
+  일부를 가려서 보여줘요. 회원은 사이드바 `🔐 로그인 관리`에서 **본인 기록**을 확인할 수 있어요.
+- **보관 기간**: 접속 기록은 **{ACCESS_LOG_DAYS}일**이 지나면 자동 삭제돼요.
+  (탈퇴하더라도 부정 이용 확인을 위해 이 기간까지만 보관)
+- **처리 위탁·보관 장소**: 앱 호스팅(Streamlit Community Cloud), 암호화된 백업(GitHub 비공개 저장소).
+  그 밖의 제3자에게 제공하지 않아요.
+- 동의를 거부할 수 있지만, 거부하면 회원가입과 서비스 이용이 제한돼요.
+- 참고: IP는 공유기·PC방·학교·모바일 통신망에서는 여러 사람이 같을 수 있고, 쿠키를 지우면
+  기기 구분값이 새로 만들어져요. 그래서 이 기록은 **참고용**이며 이것만으로 제재하지 않아요.
+"""
+
+
+def show_privacy_notice(expanded=False):
+  with st.expander('🔒 개인정보 수집·이용 안내 (IP · 접속 기기 기록)', expanded=expanded):
+    st.markdown(PRIVACY_NOTICE)
 
 
 def logout():
@@ -1843,17 +2094,19 @@ def friendly_error(exc):
 # ==========================================
 # 6. 닉네임 저장 / UI 헬퍼
 # ==========================================
-def save_nicknames(username, entries, source):
-  """닉네임 기준 중복은 건너뛰되, 클랜이 바뀌었으면 갱신한다.
+def save_nicknames(username, entries, source, platform=''):
+  """닉네임 기준 중복은 건너뛰되, 클랜·플랫폼이 바뀌었으면 갱신한다.
 
-  (신규 저장 수, 클랜 갱신 수, 건너뛴 수)를 반환한다.
+  (신규 저장 수, 클랜/플랫폼 갱신 수, 건너뛴 수)를 반환한다.
   """
+  platform = platform_code(platform)
   added = updated = skipped = 0
   with db() as conn:
     existing = {
-        nick.lower(): (row_id, clan or '')
-        for row_id, nick, clan in conn.execute(
-            'SELECT id, nickname, clan FROM nicknames WHERE username = ?',
+        nick.lower(): (row_id, clan or '', plat or '')
+        for row_id, nick, clan, plat in conn.execute(
+            "SELECT id, nickname, clan, COALESCE(platform, '') FROM nicknames"
+            ' WHERE username = ?',
             (username,),
         )
     }
@@ -1861,22 +2114,29 @@ def save_nicknames(username, entries, source):
     for e in entries:
       key = e['nickname'].lower()
       if key in existing:
-        row_id, old_clan = existing[key]
+        row_id, old_clan, old_plat = existing[key]
+        sets, vals = [], []
         if e['clan'] and e['clan'] != old_clan:
+          sets.append('clan = ?')
+          vals.append(e['clan'])
+        if platform and platform != old_plat:
+          sets.append('platform = ?')
+          vals.append(platform)
+        if sets:
           conn.execute(
-              'UPDATE nicknames SET clan = ? WHERE id = ?', (e['clan'], row_id)
+              f"UPDATE nicknames SET {', '.join(sets)} WHERE id = ?", vals + [row_id]
           )
-          existing[key] = (row_id, e['clan'])
+          existing[key] = (row_id, e['clan'] or old_clan, platform or old_plat)
           updated += 1
         else:
           skipped += 1
         continue
       cur = conn.execute(
-          'INSERT INTO nicknames (username, nickname, clan, source_image,'
-          ' created_at) VALUES (?, ?, ?, ?, ?)',
-          (username, e['nickname'], e['clan'], source, stamp),
+          'INSERT INTO nicknames (username, nickname, clan, platform, source_image,'
+          ' created_at) VALUES (?, ?, ?, ?, ?, ?)',
+          (username, e['nickname'], e['clan'], platform, source, stamp),
       )
-      existing[key] = (cur.lastrowid, e['clan'])
+      existing[key] = (cur.lastrowid, e['clan'], platform)
       added += 1
     if len(entries) >= 2:  # 한 번에 저장한 2명 이상 = 한 판(스쿼드)
       sid = secrets.token_hex(6)
@@ -1885,6 +2145,15 @@ def save_nicknames(username, entries, source):
           [(sid, username, e['nickname'], e['clan'], stamp) for e in entries],
       )
   return added, updated, skipped
+
+
+def fill_platform(owner, platform):
+  """플랫폼이 비어 있는 내 닉네임을 일괄 지정한다. 지정한 개수를 반환."""
+  with db() as conn:
+    return conn.execute(
+        "UPDATE nicknames SET platform = ? WHERE username = ? AND COALESCE(platform, '') = ''",
+        (platform_code(platform), owner),
+    ).rowcount
 
 
 def reset_region():
@@ -1943,6 +2212,43 @@ def current_platform():
   return STATS_PLATFORMS.get(st.session_state.get('stats_platform'), 'steam')
 
 
+PLATFORM_LABELS = {code: label for label, code in STATS_PLATFORMS.items()}
+
+
+def platform_label(code):
+  return PLATFORM_LABELS.get((code or '').strip().lower(), '')
+
+
+def platform_code(value):
+  """'Steam' / 'steam' → 'steam'. 알 수 없거나 비어 있으면 ''."""
+  v = (value or '').strip()
+  if v in STATS_PLATFORMS:
+    return STATS_PLATFORMS[v]
+  return v.lower() if v.lower() in PLATFORM_LABELS else ''
+
+
+def nick_platform_map(owner):
+  """내 닉네임 → 저장된 플랫폼 코드 {소문자 닉네임: 'steam'|'kakao'} (미지정은 제외)."""
+  if not owner:
+    return {}
+  with db() as conn:
+    rows = conn.execute(
+        "SELECT lower(nickname), COALESCE(platform, '') FROM nicknames"
+        " WHERE username = ? AND COALESCE(platform, '') != ''",
+        (owner,),
+    ).fetchall()
+  return dict(rows)
+
+
+def platform_for(nickname, explicit=''):
+  """링크에 쓸 플랫폼: 지정값 → 내 닉네임에 저장된 값 → 사이드바 기본값."""
+  return (
+      platform_code(explicit)
+      or nick_platform_map(st.session_state.get('username', '')).get((nickname or '').strip().lower())
+      or current_platform()
+  )
+
+
 def md_escape(text):
   return re.sub(r'([\\\[\]*_`<>])', r'\\\1', text)
 
@@ -1989,8 +2295,8 @@ div[data-testid="stElementContainer"]:has(iframe[height="0"]),
   .st-key-metrics_row [data-testid="stColumn"], .st-key-metrics_row [data-testid="column"] {
     min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;
   }
-  .st-key-metrics_grid [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
-  .st-key-metrics_grid [data-testid="stColumn"], .st-key-metrics_grid [data-testid="column"] {
+  [class*="st-key-metrics_grid"] [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.4rem !important; }
+  [class*="st-key-metrics_grid"] [data-testid="stColumn"], [class*="st-key-metrics_grid"] [data-testid="column"] {
     min-width: calc(33% - 0.4rem) !important; flex: 1 1 calc(33% - 0.4rem) !important; width: auto !important;
   }
 }
@@ -1998,8 +2304,28 @@ div[data-testid="stElementContainer"]:has(iframe[height="0"]),
 """
 
 
+FORCE_MOBILE_CSS = """
+<style>
+/* 화면 모드를 '모바일'로 고르면 PC에서도 폰 화면처럼 좁은 한 줄 레이아웃으로 보여준다 */
+.block-container { max-width: 520px !important; padding: 3.2rem 0.75rem 5rem 0.75rem !important; margin: 0 auto; }
+h1 { font-size: 1.5rem !important; line-height: 1.3 !important; }
+h2 { font-size: 1.25rem !important; }
+h3 { font-size: 1.08rem !important; }
+input, textarea { font-size: 16px !important; }
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button,
+[data-testid="stLinkButton"] a, a[data-testid^="stBaseLinkButton"] { width: 100% !important; min-height: 2.9rem; }
+[data-testid="stHorizontalBlock"] { flex-direction: column !important; gap: 0.5rem !important; }
+[data-testid="stColumn"], [data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; min-width: 0 !important; }
+.st-key-metrics_row [data-testid="stHorizontalBlock"] { flex-direction: row !important; flex-wrap: nowrap !important; gap: 0.4rem !important; }
+.st-key-metrics_row [data-testid="stColumn"], .st-key-metrics_row [data-testid="column"] { flex: 1 1 0 !important; width: auto !important; }
+</style>
+"""
+
+
 def inject_css():
   st.markdown(RESPONSIVE_CSS, unsafe_allow_html=True)
+  if st.session_state.get('view_mode') == '모바일':
+    st.markdown(FORCE_MOBILE_CSS, unsafe_allow_html=True)
 
 
 def is_mobile():
@@ -2043,12 +2369,22 @@ def _short_time(text):
   return text[:16] if re.fullmatch(r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d', text) else text
 
 
-def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적)', mobile_cols=None):
+def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적)', mobile_cols=None, platform_col=None):
   """닉네임을 전적 페이지 링크로 표시한다. PC는 표, 모바일은 카드형 목록.
 
+  링크 플랫폼: platform_col 값 → 내 닉네임에 저장된 플랫폼 → 사이드바 기본값 순서.
   PC 표의 셀 값은 'URL#닉네임' 이고, 화면에는 '#' 뒤의 닉네임만 보인다.
   """
-  platform = current_platform()
+  default_plat = current_platform()
+  own = nick_platform_map(st.session_state.get('username', ''))
+  explicit = (
+      df[platform_col].tolist() if platform_col and platform_col in df.columns else [''] * len(df)
+  )
+  nicks = [str(n) for n in df[nick_col]]
+  plats = [
+      platform_code(e) or own.get(nick_key(n)) or default_plat
+      for n, e in zip(nicks, explicit)
+  ]
 
   if is_mobile():
     clan_cols = [c for c in ('clan', '클랜') if c in df.columns]
@@ -2056,10 +2392,10 @@ def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적
       mobile_cols = [c for c in df.columns if c != nick_col and c not in clan_cols][:3]
     extra_cols = [c for c in mobile_cols if c in df.columns]
     lines = []
-    for _, row in df.head(MOBILE_LIST_LIMIT).iterrows():
-      nick = str(row[nick_col])
+    for i, (_, row) in enumerate(df.head(MOBILE_LIST_LIMIT).iterrows()):
+      nick = nicks[i]
       clan = next((str(row[c]).replace('`', '') for c in clan_cols if str(row[c]).strip()), '')
-      head = f'**[{md_escape(nick)}]({stats_url(nick, platform)})**'
+      head = f'**[{md_escape(nick)}]({stats_url(nick, plats[i])})**'
       if clan:
         head = f'`{clan}` ' + head
       extras = [
@@ -2076,7 +2412,7 @@ def nick_link_table(df, nick_col='nickname', label='닉네임 (클릭 → 전적
     return
 
   linked = df.copy()
-  linked[nick_col] = [f'{stats_url(n, platform)}#{n}' for n in df[nick_col]]
+  linked[nick_col] = [f'{stats_url(n, pl)}#{n}' for n, pl in zip(nicks, plats)]
   try:
     show_df(linked, {nick_col: link_column(label, r'#(.+)$')})
   except Exception:
@@ -2128,6 +2464,7 @@ def search_nicknames(query, limit=SEARCH_LIMIT):
     params = [q, q, q]
   sql = (
       "SELECT n.id, n.username, COALESCE(n.clan, '') AS clan, n.nickname,"
+      " COALESCE(n.platform, '') AS platform,"
       ' n.created_at, g.first_at, g.cnt'
       ' FROM nicknames n JOIN ('
       '   SELECT MAX(id) AS mid, MIN(created_at) AS first_at,'
@@ -2142,7 +2479,8 @@ def search_nicknames(query, limit=SEARCH_LIMIT):
 def load_recent_nicknames(limit=20):
   with db() as conn:
     return pd.read_sql(
-        "SELECT id, username, COALESCE(clan, '') AS clan, nickname, created_at"
+        "SELECT id, username, COALESCE(clan, '') AS clan, nickname,"
+        " COALESCE(platform, '') AS platform, created_at"
         ' FROM nicknames ORDER BY id DESC LIMIT ?',
         conn,
         params=(limit,),
@@ -2154,6 +2492,7 @@ def recent_view(df):
   return pd.DataFrame({
       '닉네임': df['nickname'],
       '클랜': df['clan'],
+      '플랫폼': df['platform'].map(lambda c: platform_label(c) or '미지정'),
       '등록 시각': df['created_at'],
       '경과': df['created_at'].map(time_ago),
       '등록자': df['username'],
@@ -2166,6 +2505,7 @@ def search_view(df):
   return pd.DataFrame({
       '닉네임': df['nickname'],
       '클랜': df['clan'],
+      '플랫폼': df['platform'].map(lambda c: platform_label(c) or '미지정'),
       '최근 등록': df['created_at'],
       '경과': df['created_at'].map(time_ago),
       '등록 회원 수': df['cnt'],
@@ -2181,10 +2521,10 @@ def show_recent_nicknames(limit=20):
   if df.empty:
     st.caption('아직 등록된 닉네임이 없습니다.')
   else:
-    nick_link_table(recent_view(df), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
+    nick_link_table(recent_view(df), nick_col='닉네임', platform_col='플랫폼', mobile_cols=['플랫폼', '경과', '등록자', '내 메모'])
 
 
-def update_nickname(actor, is_admin, row_id, clan, nick):
+def update_nickname(actor, is_admin, row_id, clan, nick, platform=None):
   """본인(또는 관리자)이 등록한 닉네임/클랜을 수정한다. (성공 여부, 메시지)."""
   clan = (clan or '').strip(' []()')
   nick = (nick or '').strip()
@@ -2214,6 +2554,10 @@ def update_nickname(actor, is_admin, row_id, clan, nick):
         (clan, nick, row_id),
     )
     propagate_rename(conn, owner, old_nick, nick, clan)
+    if platform is not None:
+      conn.execute(
+          'UPDATE nicknames SET platform = ? WHERE id = ?', (platform_code(platform), row_id)
+      )
   if owner != actor:
     log_admin('닉네임 수정', owner, f'#{row_id} → {entry_label(clan, nick)}')
   return True, f'✅ {entry_label(clan, nick)} 로 수정했습니다.'
@@ -2326,10 +2670,11 @@ def recent_squads(owner, nickname='', limit=10):
 
 def squad_markdown(squads, platform):
   lines = []
+  own = nick_platform_map(st.session_state.get('username', ''))
   for sq in squads:
     names = ' · '.join(
         (f'`{c.replace(chr(96), "")}` ' if c else '')
-        + f'[{md_escape(n)}]({stats_url(n, platform)})'
+        + f'[{md_escape(n)}]({stats_url(n, own.get(nick_key(n)) or platform)})'
         for c, n in sq['members']
     )
     lines.append(f"- **{_short_time(sq['time'])}** — {names}")
@@ -2517,8 +2862,38 @@ PUBG_MODES = [
 ]
 
 
+def _clean_api_key(key):
+  key = (key or '').strip().strip('"').strip("'").strip()
+  if key.lower().startswith('bearer '):
+    key = key[7:].strip()
+  return key
+
+
+def pubg_key_status():
+  """(키, 출처, 문제 설명). 키를 못 쓰면 키는 ''이고 이유를 알려준다."""
+  key = _clean_api_key(get_secret('PUBG_API_KEY'))
+  if key:
+    return key, 'Secrets', ''
+  stored = get_setting('pubg_api_key', '')
+  if stored:
+    key = _clean_api_key(decrypt_secret(stored))
+    if key:
+      return key, '관리자 패널', ''
+    return '', '', (
+        '관리자 패널에 저장된 키를 풀 수 없어요. 키를 저장한 뒤 APP_SECRET_KEY가 바뀐 것 같아요'
+        ' → 관리자 패널에서 PUBG API 키를 다시 저장해 주세요.'
+    )
+  for alt in ('pubg_api_key', 'PUBG_KEY', 'PUBG_API', 'PUBG_TOKEN', 'PUBG_APIKEY', 'pubg_key'):
+    if get_secret(alt):
+      return '', '', f'Secrets에 `{alt}`라는 이름으로 들어 있어요. 이름을 정확히 `PUBG_API_KEY`로 바꾸고 앱을 재시작(Reboot)하세요.'
+  return '', '', (
+      'PUBG API 키가 없어요. Secrets에 `PUBG_API_KEY = "키"`를 넣고 Reboot 하거나,'
+      ' 관리자 패널 → ⚙️ 시스템 → PUBG 공식 API에서 저장하세요.'
+  )
+
+
 def pubg_api_key():
-  return get_secret('PUBG_API_KEY') or decrypt_secret(get_setting('pubg_api_key', ''))
+  return pubg_key_status()[0]
 
 
 def pubg_request(path, api_key):
@@ -2563,14 +2938,38 @@ def fetch_pubg_summary(nickname, shard, _api_key):
 
 def pubg_friendly_error(exc):
   if isinstance(exc, LookupError):
-    return str(exc) + ' (닉네임 대소문자와 플랫폼을 확인하세요)'
+    return str(exc) + ' (닉네임 대소문자와 플랫폼(스팀/카카오)을 확인하세요)'
   if isinstance(exc, urllib.error.HTTPError):
     return {
-        401: 'PUBG API 키가 올바르지 않습니다.',
-        404: '플레이어를 찾을 수 없습니다. (닉네임 대소문자와 플랫폼을 확인하세요)',
-        429: 'API 호출 한도를 초과했어요. 1분 뒤 다시 시도하세요.',
+        400: '요청이 잘못됐어요. 닉네임에 쓸 수 없는 글자가 있는지 확인하세요. (400)',
+        401: 'PUBG API 키가 올바르지 않아요. 키를 다시 복사해 저장해 주세요. (401)',
+        403: 'PUBG API 키에 권한이 없어요. developer.pubg.com에서 키 상태를 확인하세요. (403)',
+        404: '플레이어를 찾을 수 없어요. 닉네임 대소문자와 플랫폼(스팀/카카오)을 확인하세요. (404)',
+        415: 'PUBG API 요청 형식 오류예요. (415)',
+        429: 'API 호출 한도(분당 10회)를 초과했어요. 1분 뒤 다시 시도하세요. (429)',
     }.get(exc.code, f'PUBG API 오류 ({exc.code})')
-  return f'전적을 불러오지 못했습니다: {type(exc).__name__}'
+  if isinstance(exc, urllib.error.URLError):
+    return f'PUBG 서버에 연결하지 못했어요: {exc.reason}'
+  if isinstance(exc, (KeyError, TypeError, ValueError)):
+    return f'PUBG 응답 형식이 예상과 달라요: {type(exc).__name__}'
+  return f'전적을 불러오지 못했습니다: {type(exc).__name__}: {exc}'
+
+
+def pubg_test_connection(api_key, nickname='', shard='steam'):
+  """관리자용 연결 테스트. (성공 여부, 메시지)"""
+  try:
+    data = pubg_request('/shards/steam/seasons', api_key)
+    n = len(data.get('data') or [])
+  except Exception as e:
+    return False, pubg_friendly_error(e)
+  msg = f'✅ 키가 정상이에요 (시즌 {n}개 확인).'
+  if nickname:
+    try:
+      df = fetch_pubg_summary(nickname, shard, api_key)
+      msg += f' `{nickname}`({shard}) 전적 {len(df)}개 모드 조회 성공.'
+    except Exception as e:
+      return False, msg + ' 하지만 닉네임 조회는 실패: ' + pubg_friendly_error(e)
+  return True, msg
 
 
 # ---------- 시간대별 · 요일별 통계 ----------
@@ -2624,12 +3023,14 @@ def apply_nick_choice(pc_key, clan_key, m_key, mobile, nick, clan):
       st.session_state[clan_key] = clan
 
 
-def nickname_tools(nickname, key_prefix):
+def nickname_tools(nickname, key_prefix, platform=None):
   """닉네임 하나에 대한 보조 도구: 비슷한 DB 닉네임 · 헷갈리는 글자 후보 · 전적 요약(API)."""
   nickname = (nickname or '').strip()
   if not nickname:
+    st.button('📊 전적 요약 불러오기', key=f'pubg_btn_{key_prefix}', disabled=True,
+              help='닉네임을 입력하면 눌러볼 수 있어요.')
     return
-  plat = current_platform()
+  plat = platform_for(nickname, platform or '')
   similar = find_similar_in_db(nickname)
   if similar:
     st.info('DB에 철자만 다른 닉네임이 있어요: ' + ', '.join(f'`{n}`' for n, _ in similar))
@@ -2641,9 +3042,17 @@ def nickname_tools(nickname, key_prefix):
           ' 눌러서 전적 페이지가 열리면 그 철자가 맞는 거예요.'
       )
       st.markdown(' · '.join(f'[{md_escape(v)}]({stats_url(v, plat)})' for v in variants))
-  api_key = pubg_api_key()
+  api_key, _src, problem = pubg_key_status()
+  if not api_key:
+    st.button('📊 전적 요약 불러오기', key=f'pubg_btn_{key_prefix}', disabled=True)
+    if st.session_state.get('is_admin'):
+      st.caption(f'⚠️ 전적 요약을 쓸 수 없어요: {problem}')
+    else:
+      st.caption('전적 요약은 관리자가 PUBG API 키를 등록하면 쓸 수 있어요. 지금은 위의 DAK.GG 버튼을 이용하세요.')
+    return
   if api_key:
     sum_key = f'pubg_sum_{key_prefix}_{plat}_{nickname}'
+    st.caption(f'플랫폼: {"카카오" if plat == "kakao" else "스팀"} · PUBG 공식 API (닉네임은 대소문자까지 정확해야 해요)')
     if st.button('📊 전적 요약 불러오기', key=f'pubg_btn_{key_prefix}'):
       try:
         st.session_state[sum_key] = fetch_pubg_summary(nickname, plat, api_key)
@@ -2658,6 +3067,164 @@ def nickname_tools(nickname, key_prefix):
         st.caption('K/D는 (킬 ÷ 승리하지 못한 판 수)로 추정한 값이에요. 출처: PUBG 공식 API (평생 기록).')
     elif isinstance(result, str):
       st.error(result)
+
+
+# ---------- 관리자: 접속 기록 · 다중 계정 확인 ----------
+def mask_ip(ip, full=False):
+  if not ip:
+    return '알 수 없음'
+  if full:
+    return ip
+  if ':' in ip:
+    return ':'.join(ip.split(':')[:3]) + ':****'
+  parts = ip.split('.')
+  return '.'.join(parts[:2] + ['***', '***']) if len(parts) == 4 else ip
+
+
+def shared_accounts(column):
+  """같은 기기ID/IP를 쓴 계정 묶음 (성공한 접속만)."""
+  assert column in ('device_id', 'ip')
+  marks = ','.join('?' * len(ACCESS_OK_EVENTS))
+  with db() as conn:
+    return conn.execute(
+        f'SELECT {column}, GROUP_CONCAT(DISTINCT username), COUNT(DISTINCT username),'
+        f' MAX(created_at), COUNT(*) FROM access_log'
+        f" WHERE {column} != '' AND event IN ({marks})"
+        f' GROUP BY {column} HAVING COUNT(DISTINCT username) >= 2 ORDER BY 4 DESC',
+        ACCESS_OK_EVENTS,
+    ).fetchall()
+
+
+def access_frame(rows, full_ip):
+  df = pd.DataFrame(rows, columns=[
+      '시각', '계정', '구분', 'IP', '기기ID', '기기', 'OS', '브라우저', '비고', 'User-Agent'])
+  df['IP'] = df['IP'].map(lambda v: mask_ip(v, full_ip))
+  df['기기ID'] = df['기기ID'].map(lambda v: (v[:8] + '…') if v else '없음')
+  return df
+
+
+ACCESS_COLS = ('created_at, username, event, ip, device_id, device, os, browser, note,'
+               ' user_agent')
+
+
+def render_access_admin():
+  require_admin()
+  full_ip = st.session_state.get('role') == ROLE_SUPER
+  st.caption(
+      f'로그인·자동 로그인·회원가입·로그인 실패 때 IP와 접속 기기를 기록해요. {ACCESS_LOG_DAYS}일 지난 기록은 자동 삭제돼요.'
+      + ('' if full_ip else ' 일반관리자에게는 IP 일부가 가려져 보여요.')
+  )
+  st.caption(
+      '⚠️ 판단 기준: **같은 기기ID**는 같은 브라우저라는 강한 신호예요(쿠키를 지우면 바뀜). '
+      '**같은 IP**는 공유기·PC방·학교·모바일 통신망이면 서로 다른 사람도 같을 수 있는 약한 신호예요. '
+      'IP는 호스팅 환경에 따라 비어 있거나 조작될 수 있으니 참고용으로만 쓰세요.'
+  )
+  with db() as conn:
+    total = conn.execute('SELECT COUNT(*) FROM access_log').fetchone()[0]
+    n_users = conn.execute('SELECT COUNT(DISTINCT username) FROM access_log').fetchone()[0]
+    n_noip = conn.execute("SELECT COUNT(*) FROM access_log WHERE ip = ''").fetchone()[0]
+  dev_groups = shared_accounts('device_id')
+  ip_groups = shared_accounts('ip')
+  with keyed_container('metrics_grid_access'):
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('기록 수', total)
+    c2.metric('기록된 회원', n_users)
+    c3.metric('같은 기기 묶음', len(dev_groups))
+    c4.metric('같은 IP 묶음', len(ip_groups))
+  if total and n_noip == total:
+    st.info('IP가 모두 비어 있어요. 지금 호스팅 환경이 접속 IP를 앱에 전달하지 않는 것 같아요. 기기ID·기기 정보로 구분하세요.')
+
+  st.markdown('#### ⚠️ 같은 기기에서 접속한 계정 (다중 계정 가능성 높음)')
+  if dev_groups:
+    show_df(pd.DataFrame(
+        [((d[:8] + '…'), a.replace(',', ', '), n, last, cnt) for d, a, n, last, cnt in dev_groups],
+        columns=['기기ID', '계정들', '계정 수', '마지막 접속', '접속 수'],
+    ))
+  else:
+    st.caption('발견된 묶음이 없어요.')
+
+  st.markdown('#### 같은 IP에서 접속한 계정 (참고)')
+  if ip_groups:
+    show_df(pd.DataFrame(
+        [(mask_ip(ip, full_ip), a.replace(',', ', '), n, last, cnt) for ip, a, n, last, cnt in ip_groups],
+        columns=['IP', '계정들', '계정 수', '마지막 접속', '접속 수'],
+    ))
+  else:
+    st.caption('발견된 묶음이 없어요.')
+
+  st.divider()
+  st.markdown('#### 👤 회원별 조회')
+  with db() as conn:
+    names = [r[0] for r in conn.execute(
+        'SELECT username FROM access_log GROUP BY username ORDER BY MAX(id) DESC'
+    ).fetchall()]
+  if not names:
+    st.info('아직 접속 기록이 없어요. 회원이 로그인하면 쌓이기 시작해요.')
+    return
+  who = st.selectbox('회원 선택', ['(선택하세요)'] + names, key='access_who')
+  if who != '(선택하세요)':
+    if st.session_state.get('access_who_logged') != who:  # 누가 누구 기록을 봤는지 남김
+      st.session_state['access_who_logged'] = who
+      log_admin('접속 기록 조회', who)
+    marks = ','.join('?' * len(ACCESS_OK_EVENTS))
+    with db() as conn:
+      rows = conn.execute(
+          f'SELECT {ACCESS_COLS} FROM access_log WHERE username = ? ORDER BY id DESC LIMIT 300',
+          (who,),
+      ).fetchall()
+      same_dev = conn.execute(
+          f'SELECT DISTINCT b.username FROM access_log a JOIN access_log b'
+          f" ON a.device_id = b.device_id AND a.device_id != ''"
+          f' WHERE a.username = ? AND b.username != ? AND b.event IN ({marks})',
+          (who, who, *ACCESS_OK_EVENTS),
+      ).fetchall()
+      same_ip = conn.execute(
+          f'SELECT DISTINCT b.username FROM access_log a JOIN access_log b'
+          f" ON a.ip = b.ip AND a.ip != ''"
+          f' WHERE a.username = ? AND b.username != ? AND b.event IN ({marks})',
+          (who, who, *ACCESS_OK_EVENTS),
+      ).fetchall()
+    df = access_frame(rows, full_ip)
+    m1, m2, m3 = st.columns(3)
+    m1.metric('접속 기록', len(df))
+    m2.metric('사용한 기기', df.loc[df['기기ID'] != '없음', '기기ID'].nunique())
+    m3.metric('사용한 IP', df.loc[df['IP'] != '알 수 없음', 'IP'].nunique())
+    if same_dev:
+      st.error('같은 기기를 쓴 다른 계정: ' + ', '.join(f'`{r[0]}`' for r in same_dev))
+    if same_ip:
+      st.warning('같은 IP를 쓴 다른 계정 (참고): ' + ', '.join(f'`{r[0]}`' for r in same_ip))
+    if not same_dev and not same_ip:
+      st.success('같은 기기·IP를 쓴 다른 계정이 없어요.')
+    show_df(df.drop(columns=['계정', 'User-Agent']))
+    with st.expander('원본 User-Agent 보기'):
+      show_df(df[['시각', 'User-Agent']])
+
+  st.divider()
+  st.markdown('#### 🕒 최근 접속 기록 (전체)')
+  q = st.text_input('계정·기기·브라우저로 거르기', key='access_filter')
+  with db() as conn:
+    rows = conn.execute(
+        f'SELECT {ACCESS_COLS} FROM access_log ORDER BY id DESC LIMIT 500'
+    ).fetchall()
+  df = access_frame(rows, full_ip)
+  if q.strip():
+    ql = q.strip().lower()
+    df = df[df.apply(lambda r: ql in ' '.join(map(str, r.values)).lower(), axis=1)]
+  show_df(df.drop(columns=['User-Agent']))
+  if full_ip:
+    st.download_button(
+        '📥 접속 기록 CSV 다운로드 (최종관리자)',
+        data=df.to_csv(index=False).encode('utf-8-sig'),
+        file_name='pubg_access_log.csv', mime='text/csv',
+    )
+    with st.expander('🗑️ 접속 기록 전체 삭제'):
+      sure = st.checkbox('모든 접속 기록을 삭제합니다. 되돌릴 수 없어요.', key='access_wipe_ok')
+      if st.button('전체 삭제', disabled=not sure, key='access_wipe'):
+        with db() as conn:
+          conn.execute('DELETE FROM access_log')
+        log_admin('접속 기록 전체 삭제')
+        flash('접속 기록을 모두 삭제했습니다.')
+        st.rerun()
 
 
 # ==========================================
@@ -3049,7 +3616,10 @@ if not st.session_state.logged_in and not st.session_state.get('cookie_checked')
   st.session_state.cookie_checked = True
   if login_with_cookie():
     st.rerun()
+if cookies_supported():
+  device_id()  # 처음 방문한 브라우저라면 기기 구분 쿠키를 만들어 둔다
 flush_cookie_cmd()
+flush_device_cookie()
 inject_css()
 
 if not st.session_state.logged_in:
@@ -3066,6 +3636,7 @@ if not st.session_state.logged_in:
   with tab_login:
     st.subheader('로그인')
     st.caption('관리 기능은 권한이 있는 계정으로 로그인했을 때만 표시됩니다.')
+    st.caption('🔒 보안과 다중 계정 확인을 위해 로그인할 때 IP·접속 기기 정보가 기록돼요. (아래 안내 참고)')
     twofa_pend = st.session_state.get('twofa_pending')
     if twofa_pend:
       st.info('📧 가입한 이메일로 보낸 6자리 인증 코드를 입력해 주세요.')
@@ -3138,6 +3709,7 @@ if not st.session_state.logged_in:
                 st.rerun()
               else:
                 st.error(msg)
+    show_privacy_notice()
 
   with tab_register:
     st.subheader('신규 회원가입')
@@ -3160,6 +3732,8 @@ if not st.session_state.logged_in:
       if verify_clicked:
         ok, msg = finish_signup(pending_user, code_in)
         if ok:
+          mark_privacy_agreed(pending_user)
+          log_access(pending_user, '회원가입')
           st.session_state.signup_pending = ''
           flash(msg)
           st.rerun()
@@ -3174,6 +3748,7 @@ if not st.session_state.logged_in:
         st.session_state.signup_pending = ''
         st.rerun()
     else:
+      show_privacy_notice()
       with st.form('register_form'):
         nu_input = text_input_ac('사용할 아이디 (영문/숫자/_ 3~20자)', 'username')
         ne_input = st.text_input(
@@ -3181,8 +3756,13 @@ if not st.session_state.logged_in:
         )
         np_input = text_input_ac('사용할 비밀번호 (8자 이상)', 'new-password', type='password')
         np_confirm = text_input_ac('비밀번호 확인', 'new-password', type='password')
+        agree_in = st.checkbox(
+            '위 개인정보 수집·이용 안내(IP · 접속 기기 기록 포함)를 읽었고 동의합니다. (필수)'
+        )
         if st.form_submit_button('인증 코드 받기' if verify_on else '회원가입'):
-          if not nu_input or not np_input or (verify_on and not ne_input):
+          if not agree_in:
+            st.warning('개인정보 수집·이용에 동의해야 가입할 수 있어요.')
+          elif not nu_input or not np_input or (verify_on and not ne_input):
             st.warning('필수 항목을 모두 입력해주세요.')
           elif np_input != np_confirm:
             st.error('비밀번호가 일치하지 않습니다.')
@@ -3195,6 +3775,9 @@ if not st.session_state.logged_in:
               st.error(msg)
           else:
             success, msg = register_user(nu_input.strip(), np_input, ne_input)
+            if success:
+              mark_privacy_agreed(nu_input.strip())
+              log_access(nu_input.strip(), '회원가입')
             (st.success if success else st.error)(msg)
 
   if needs_setup:
@@ -3255,6 +3838,18 @@ if not st.session_state.logged_in:
 if not refresh_session_role():
   st.rerun()
 username = st.session_state.username
+if not privacy_agreed(username):
+  st.title('🔒 개인정보 수집·이용 동의')
+  st.info('서비스 운영 방식이 바뀌어 접속 기록(IP · 접속 기기)을 수집하게 되었어요. 계속 이용하려면 아래 내용에 동의해 주세요.')
+  st.markdown(PRIVACY_NOTICE)
+  pa1, pa2 = st.columns(2)
+  if pa1.button('✅ 동의하고 계속하기', type='primary', use_container_width=True):
+    mark_privacy_agreed(username)
+    st.rerun()
+  if pa2.button('동의하지 않음 (로그아웃)', use_container_width=True):
+    logout()
+    st.rerun()
+  st.stop()
 st.sidebar.title(f'환영합니다, {username}님!')
 if st.session_state.role != ROLE_USER:
   st.sidebar.markdown(f'**[{ROLE_LABELS[st.session_state.role]}]**')
@@ -3300,6 +3895,19 @@ with st.sidebar.expander('🔐 로그인 관리'):
       conn.execute('DELETE FROM login_tokens WHERE username = ?', (username,))
     logout()
     st.rerun()
+  if st.checkbox('내 최근 접속 기록 보기', key='my_access_log'):
+    with db() as conn:
+      my_log = pd.read_sql(
+          'SELECT created_at AS 시각, event AS 구분, ip AS IP, device AS 기기, os AS OS,'
+          ' browser AS 브라우저 FROM access_log WHERE username = ? ORDER BY id DESC LIMIT 10',
+          conn, params=(username,),
+      )
+    if my_log.empty:
+      st.caption('아직 기록이 없어요.')
+    else:
+      my_log['IP'] = my_log['IP'].replace('', '알 수 없음')
+      st.dataframe(my_log, hide_index=True)
+    st.caption(f'본인이 아닌 접속이 보이면 비밀번호를 바꾸고 위 버튼을 누르세요. 기록은 {ACCESS_LOG_DAYS}일 후 자동 삭제돼요.')
 
 with st.sidebar.expander('📧 이메일 · 보안'):
   sec = get_security(username)
@@ -3351,16 +3959,16 @@ with st.sidebar.expander('📧 이메일 · 보안'):
 
 st.sidebar.divider()
 st.sidebar.selectbox(
-    '🔍 전적 검색 플랫폼',
+    '🔍 기본 전적 플랫폼',
     list(STATS_PLATFORMS),
     key='stats_platform',
-    help='닉네임을 클릭하면 이 플랫폼 기준 DAK.GG 전적 페이지가 새 탭으로 열립니다.',
+    help='닉네임마다 저장된 플랫폼(Steam/Kakao)을 따라 링크가 열려요. 이 설정은 플랫폼이 없는 닉네임과 새로 저장할 때의 기본값으로만 쓰여요.',
 )
 st.sidebar.selectbox(
     '📱 화면 모드',
     ['자동', '모바일', 'PC'],
     key='view_mode',
-    help='자동: 접속 기기에 맞춰 표시 · 목록이 불편하면 직접 바꿔보세요.',
+    help='자동: 접속 기기에 맞춰 표시 · 모바일: PC에서도 폰 화면처럼(좁은 한 줄, 카드 목록) · PC: 표 형태. 폰 화면 폭 자체는 바꿀 수 없어요.',
 )
 
 # ==========================================
@@ -3575,7 +4183,16 @@ with main_tab1:
     st.subheader('✨ 추출된 닉네임 확인 및 선택 등록')
     ver = st.session_state.extract_ver
     st.caption('글자가 틀렸을 수 있어요. 닉네임을 고친 뒤 🔍 버튼으로 전적 페이지를 열어 확인하세요.')
-    plat = current_platform()
+    _plat_labels = list(STATS_PLATFORMS)
+    save_platform_label = st.radio(
+        '플랫폼 (이 닉네임들이 속한 서버)',
+        _plat_labels,
+        index=_plat_labels.index(PLATFORM_LABELS.get(current_platform(), _plat_labels[0])),
+        horizontal=True,
+        key=f'save_platform_{ver}',
+        help='스팀 계정이면 Steam, 카카오 계정이면 Kakao를 고르세요. 저장되고 전적 링크에도 쓰여요.',
+    )
+    plat = STATS_PLATFORMS[save_platform_label]
     mobile = is_mobile()
 
     picked_batches = []  # [(파일명, 선택된 항목)]
@@ -3696,11 +4313,11 @@ with main_tab1:
       else:
         added = updated = skipped = 0
         for source, final in plans:
-          a, u, sk = save_nicknames(username, final, source)
+          a, u, sk = save_nicknames(username, final, source, platform=plat)
           added, updated, skipped = added + a, updated + u, skipped + sk
         parts = [f'{added}개 저장']
         if updated:
-          parts.append(f'클랜 정보 {updated}개 갱신')
+          parts.append(f'클랜·플랫폼 정보 {updated}개 갱신')
         if skipped:
           parts.append(f'이미 등록된 {skipped}개 건너뜀')
         if len(plans) > 1:
@@ -3744,14 +4361,14 @@ with main_tab_search:
     if cand.empty:
       st.info('검색 결과가 없습니다. 철자를 바꿔서 다시 찾아보세요.')
     else:
-      nick_link_table(search_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
+      nick_link_table(search_view(cand), nick_col='닉네임', platform_col='플랫폼', mobile_cols=['플랫폼', '경과', '등록자', '내 메모'])
   else:
     cand = load_recent_nicknames(30)
     st.subheader('🕒 최근 추가된 닉네임')
     if cand.empty:
       st.info('아직 등록된 닉네임이 없습니다.')
     else:
-      nick_link_table(recent_view(cand), nick_col='닉네임', mobile_cols=['경과', '등록자', '내 메모'])
+      nick_link_table(recent_view(cand), nick_col='닉네임', platform_col='플랫폼', mobile_cols=['플랫폼', '경과', '등록자', '내 메모'])
 
   # ---- 전적 확인 (오타 수정 후 검색) ----
   st.divider()
@@ -3777,27 +4394,37 @@ with main_tab_search:
   v_nick = vc2.text_input(
       '닉네임 (수정 가능)', value=base.nickname if base else '', key=f'v_nick_{pick}'
   ).strip()
+  _plat_labels = list(STATS_PLATFORMS)
+  _base_plat = platform_code(base.platform) if base is not None else ''
+  _start_plat = _base_plat or current_platform()
+  v_plat_label = st.radio(
+      '플랫폼', _plat_labels,
+      index=_plat_labels.index(PLATFORM_LABELS.get(_start_plat, _plat_labels[0])),
+      horizontal=True, key=f'v_plat_{pick}',
+      help='이 닉네임이 속한 서버예요. 전적 링크와 DB 저장값에 쓰여요.',
+  )
+  v_plat = STATS_PLATFORMS[v_plat_label]
 
   vb1, vb2 = st.columns(2)
   with vb1:
     if v_nick:
-      stats_button('🔍 DAK.GG에서 전적 보기', stats_url(v_nick, current_platform()))
+      stats_button('🔍 DAK.GG에서 전적 보기', stats_url(v_nick, v_plat))
     else:
       st.button('🔍 DAK.GG에서 전적 보기', disabled=True, key='verify_disabled')
   with vb2:
     if base is not None:
       if st.session_state.is_admin or base.username == username:
-        unchanged = (v_nick, v_clan.strip(' []()')) == (base.nickname, base.clan)
-        if st.button('💾 DB의 닉네임·클랜을 이 값으로 수정', disabled=unchanged or not v_nick):
+        unchanged = (v_nick, v_clan.strip(' []()'), v_plat) == (base.nickname, base.clan, _base_plat)
+        if st.button('💾 DB의 닉네임·클랜·플랫폼을 이 값으로 수정', disabled=unchanged or not v_nick):
           ok, msg = update_nickname(
-              username, st.session_state.is_admin, int(pick), v_clan, v_nick
+              username, st.session_state.is_admin, int(pick), v_clan, v_nick, platform=v_plat
           )
           flash(msg, 'success' if ok else 'error')
           st.rerun()
       else:
         st.caption('다른 회원이 등록한 닉네임은 관리자만 수정할 수 있어요.')
 
-  nickname_tools(v_nick, 'search')
+  nickname_tools(v_nick, 'search', v_plat)
 
 # ------------------------------------------
 # [탭] 함께한 사람 (스쿼드 기록)
@@ -3920,7 +4547,7 @@ with main_tab_notes:
     flash('메모를 삭제했어요.')
     st.rerun()
   if nick_in:
-    stats_button('🔍 전적 보기', stats_url(nick_in, current_platform()))
+    stats_button('🔍 전적 보기', stats_url(nick_in, platform_for(nick_in)))
     nickname_tools(nick_in, 'notes')
 
 # ------------------------------------------
@@ -3931,7 +4558,8 @@ with main_tab2:
 
   with db() as conn:
     df_my = pd.read_sql(
-        "SELECT id, COALESCE(clan, '') AS clan, nickname, source_image,"
+        "SELECT id, COALESCE(clan, '') AS clan, nickname,"
+        " COALESCE(platform, '') AS platform, source_image,"
         ' created_at FROM nicknames'
         ' WHERE username = ? ORDER BY id DESC',
         conn,
@@ -3941,8 +4569,20 @@ with main_tab2:
   if df_my.empty:
     st.info('아직 수집된 닉네임이 없습니다.')
   else:
-    nick_link_table(df_my, mobile_cols=['created_at', 'source_image'])
-    st.caption('닉네임을 클릭하면 DAK.GG 전적 페이지가 새 탭으로 열립니다 (검색 없이 바로 프로필).')
+    nick_link_table(
+        df_my.assign(platform=df_my['platform'].map(lambda c: platform_label(c) or '미지정')),
+        platform_col='platform',
+        mobile_cols=['platform', 'created_at', 'source_image'],
+    )
+    st.caption('닉네임을 클릭하면 저장된 플랫폼의 DAK.GG 전적 페이지가 새 탭으로 열립니다.')
+    _missing = int((df_my['platform'] == '').sum())
+    if _missing:
+      st.info(f'플랫폼이 지정되지 않은 닉네임이 {_missing}개 있어요. 이 닉네임들은 사이드바의 기본 플랫폼으로 링크가 열려요.')
+      _fill_label = st.radio('일괄 지정할 플랫폼', list(STATS_PLATFORMS), horizontal=True, key='fill_platform_radio')
+      if st.button(f'미지정 {_missing}개를 {_fill_label}로 지정', key='fill_platform_btn'):
+        _n = fill_platform(username, STATS_PLATFORMS[_fill_label])
+        flash(f'✅ {_n}개를 {_fill_label}로 지정했어요.')
+        st.rerun()
     st.download_button(
         label='📥 내 닉네임 목록 CSV 다운로드',
         data=df_my.to_csv(index=False).encode('utf-8-sig'),
@@ -3987,9 +4627,14 @@ if st.session_state.is_admin:
         st.warning('💾 아직 DB 백업을 만든 적이 없어요. 호스팅이 재시작되면 데이터가 사라질 수 있으니 `시스템` 탭에서 백업을 받아 두세요.')
       elif _age_h > 24:
         st.warning(f'💾 마지막 백업이 {_age_h / 24:.0f}일 전이에요. `시스템` 탭에서 새 백업을 받아 두세요.')
-    a_dash, a_nick, a_user, a_log, a_sys = st.tabs(
-        ['📈 대시보드', '🗂 닉네임 관리', '👥 회원 관리', '📜 활동 로그', '⚙️ 시스템 (최종관리자)']
+    a_dash, a_nick, a_user, a_access, a_log, a_sys = st.tabs(
+        ['📈 대시보드', '🗂 닉네임 관리', '👥 회원 관리', '🖥️ 접속 기록', '📜 활동 로그',
+         '⚙️ 시스템 (최종관리자)']
     )
+
+    # ---------- 접속 기록 (다중 계정 확인) ----------
+    with a_access:
+      render_access_admin()
 
     # ---------- 대시보드 ----------
     with a_dash:
@@ -4037,7 +4682,8 @@ if st.session_state.is_admin:
       with db() as conn:
         df_all = pd.read_sql(
             'SELECT id, username, COALESCE(clan, \'\') AS clan, nickname,'
-            ' source_image, created_at FROM nicknames ORDER BY id DESC',
+            ' COALESCE(platform, \'\') AS platform, source_image, created_at'
+            ' FROM nicknames ORDER BY id DESC',
             conn,
         )
 
@@ -4078,8 +4724,8 @@ if st.session_state.is_admin:
           st.caption('표에는 최근 500건만 표시됩니다 (CSV에는 전체 포함).')
         plat = current_platform()
         edited = show_editor(
-            view.assign(전적=[stats_url(n, plat) for n in view['nickname']]),
-            disabled=['id', 'username', 'source_image', 'created_at', '전적'],
+            view.assign(전적=[stats_url(n, platform_code(pl) or plat) for n, pl in zip(view['nickname'], view['platform'])]),
+            disabled=['id', 'username', 'platform', 'source_image', 'created_at', '전적'],
             key=f'nick_editor_{sel_user}_{sel_clan}_{query}_{plat}',
             column_config={'전적': link_column('전적', '🔍 전적 보기')},
         )
@@ -4429,8 +5075,18 @@ if st.session_state.is_admin:
             '키를 등록하면 검색·즐겨찾기 화면에서 앱 안에 전적 요약을 보여줘요.'
             ' Secrets에 `PUBG_API_KEY`로 넣어도 됩니다. 키 발급: https://developer.pubg.com'
         )
-        if get_secret('PUBG_API_KEY'):
-          st.success('Secrets의 `PUBG_API_KEY`를 사용 중입니다.')
+        _pk, _psrc, _pprob = pubg_key_status()
+        if _pk:
+          st.success(f'PUBG API 키 사용 중 (출처: {_psrc} · 끝자리 …{_pk[-4:]})')
+        else:
+          st.warning(_pprob)
+        with st.form('pubg_test_form'):
+          tc1, tc2 = st.columns([3, 1])
+          test_nick = tc1.text_input('테스트할 닉네임 (선택)', placeholder='비워두면 키만 확인')
+          test_plat = tc2.selectbox('플랫폼', ['steam', 'kakao'])
+          if st.form_submit_button('🔌 연결 테스트', disabled=not _pk):
+            ok_t, msg_t = pubg_test_connection(_pk, test_nick.strip(), test_plat)
+            (st.success if ok_t else st.error)(msg_t)
         with st.form('pubg_api_form'):
           pubg_key_in = st.text_input(
               'PUBG API 키', type='password',
